@@ -103,15 +103,6 @@ def test_capture_date_beats_filename(tmp_path):
     assert pm.get_photo_date(p) == datetime(2018, 7, 7, 7, 7, 7)
 
 
-def test_organize_uses_capture_date(tmp_path):
-    src, out = tmp_path / "src", tmp_path / "out"
-    src.mkdir()
-    scene().save(src / "a.jpg", exif=exif_bytes(original="2019:05:05 12:00:00",
-                                                ifd0="2024:01:01 10:00:00"))
-    pm.run_organize(src, out)
-    assert (out / "2019" / "05-Mayo" / "a.jpg").exists()
-
-
 # ──────────────────────────────────────────────────────────────
 # Dedup: nunca borrar el original por una copia generada
 # ──────────────────────────────────────────────────────────────
@@ -137,7 +128,7 @@ def test_custom_output_dir_is_marked_and_skipped(tmp_path):
     src.mkdir()
     scene().save(src / "a.jpg")
     custom = src / "mi_salida"
-    pm.run_organize(src, custom)
+    pm.run_compress(src, custom, fmt="jpeg")
     assert (custom / pm.OUTPUT_MARKER).exists()
     found = pm.find_images(src)
     assert found == [src / "a.jpg"]
@@ -174,7 +165,7 @@ def test_enhance_encodes_once_and_keeps_metadata(tmp_path):
     scene().save(src / "a.jpg", quality=95, icc_profile=icc,
                  exif=exif_bytes(original="2019:05:05 12:00:00"))
 
-    pm.run_enhance(src, out, "sharpen")
+    pm.run_enhance(src, out, "hdr")
 
     with Image.open(out / "a.jpg") as res:
         # Tabla de cuantización de luminancia: q95 → primer coef. 2; q75 → 8
@@ -188,7 +179,7 @@ def test_enhance_applies_orientation_once(tmp_path):
     src.mkdir()
     # 320x240 almacenada, orientación 6 (rotar 90°) → se ve 240x320
     scene().save(src / "r.jpg", quality=95, exif=exif_bytes(orientation=6))
-    pm.run_enhance(src, out, "sharpen")
+    pm.run_enhance(src, out, "hdr")
     with Image.open(out / "r.jpg") as res:
         assert res.size == (240, 320)
         assert res.getexif().get(274) in (None, 1)
@@ -768,3 +759,46 @@ def test_hdr_levels_are_ordered():
     lifts = [_lum(pm.enhance_hdr(img, lvl))[:, :half - 100].mean() for lvl in ("suave", "normal", "fuerte")]
     assert lifts[0] < lifts[1] < lifts[2]
     assert lifts[0] > _lum(img)[:, :half - 100].mean() + 10
+
+
+# ──────────────────────────────────────────────────────────────
+# Menú de mejora: 1 automático, 2 Real-ESRGAN, 3 HDR, 4 diagnóstico
+# ──────────────────────────────────────────────────────────────
+
+def _run_menu(monkeypatch, tmp_path, answers):
+    src = tmp_path / "fotos"
+    src.mkdir(exist_ok=True)
+    calls = []
+    monkeypatch.setattr(pm, "run_enhance", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(pm, "find_realesrgan", lambda: tmp_path / "fake")
+    feed = iter([str(src), ""] + answers)
+    asked = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": (asked.append(prompt), next(feed))[1])
+    pm.menu_enhance()
+    return calls, asked
+
+
+@pytest.mark.parametrize("opt, mode", [("1", "auto"), ("2", "realesrgan"), ("4", "diagnose")])
+def test_menu_auto_esrgan_diagnose_ask_nothing_and_use_max(opt, mode, monkeypatch, tmp_path):
+    calls, asked = _run_menu(monkeypatch, tmp_path, [opt])
+    assert len(asked) == 3                       # carpeta, salida, modo
+    (args, kwargs), = calls
+    assert args[2] == mode
+    assert kwargs["target"] == "4k" and kwargs["hdr"] == "fuerte"
+
+
+@pytest.mark.parametrize("answer, level", [("1", "suave"), ("", "normal"), ("3", "fuerte")])
+def test_menu_hdr_asks_intensity(answer, level, monkeypatch, tmp_path):
+    calls, asked = _run_menu(monkeypatch, tmp_path, ["3", answer])
+    assert any("Intensidad" in q for q in asked)
+    (args, kwargs), = calls
+    assert args[2] == "hdr" and kwargs["hdr"] == level
+
+
+def test_auto_target_upscales_small_to_x4_but_not_large(tmp_path):
+    exe = _fake_esrgan_exe(tmp_path)
+    out, a, actions = pm.enhance_adaptive(photo(640, 480), esrgan=exe, target=pm.AUTO_TARGET)
+    assert out.shape[:2] == (1920, 2560)          # ×4 (4K pediría ×4,5)
+    _, a, actions = pm.enhance_adaptive(photo(4000, 3000), esrgan=exe,
+                                        target=pm.AUTO_TARGET, dry_run=True)
+    assert not any(x.startswith("super-resolución") for x in actions)

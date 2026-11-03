@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Photo Manager CLI v1.11.0
-Herramienta completa de gestión de fotos.
+Photo Manager CLI v1.12.0
+Herramienta de gestión de fotos.
 
 Funcionalidades:
   1. Deduplicar fotos (pHash + BK-tree + complete-link, caché SQLite)
   2. Comparar dos carpetas en busca de duplicados cruzados
-  3. Mejorar fotos: modo automático que analiza cada foto (ruido, exposición,
-     rango tonal, dominante de color, nitidez, resolución) y corrige solo lo
-     necesario; ajustes OpenCV sueltos; super-resolución FSRCNN/ESPCN y
-     Real-ESRGAN (opcional, binario externo realesrgan-ncnn-vulkan)
-  4. Organizar por fecha (Año/Mes: EXIF captura → nombre de archivo → mtime)
-  5. Detectar fotos borrosas (varianza del Laplaciano, resolución normalizada)
-  6. Comprimir / Convertir (HEIF, WebP, JPEG)
-  7. Estadísticas de carpeta
+  3. Mejorar fotos:
+       - Automático: analiza cada foto y corrige solo lo necesario
+         (super-resolución hasta 4K con Real-ESRGAN, ruido, color, rango,
+         HDR fuerte en fotos oscuras, nitidez)
+       - Real-ESRGAN: amplía hasta 4K (máximo ×4)
+       - HDR: aclara sombras sin quemar luces (suave / normal / fuerte)
+       - Diagnóstico: reporte de lo que haría el modo automático
+  4. Detectar fotos borrosas (varianza del Laplaciano, resolución normalizada)
+  5. Comprimir / Convertir (HEIF, WebP, JPEG)
 
 Dependencias:
   pip install Pillow imagehash pillow-heif opencv-contrib-python==4.10.0.84
@@ -41,7 +42,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -80,20 +80,11 @@ try:
 except ImportError:
     _CV2 = False
 
-# OpenCV dnn_superres (opcional — super-resolución IA)
-_SUPERRES = False
-if _CV2:
-    try:
-        _sr_test = cv2.dnn_superres.DnnSuperResImpl_create()
-        _SUPERRES = True
-    except AttributeError:
-        pass
-
 # ══════════════════════════════════════════════════
 # CONSTANTES
 # ══════════════════════════════════════════════════
 
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 
 # [FIX #12] Separar formatos soportados por Pillow vs RAW
 PILLOW_EXTENSIONS = {
@@ -102,25 +93,6 @@ PILLOW_EXTENSIONS = {
 }
 RAW_EXTENSIONS = {".raw", ".cr2", ".nef", ".arw", ".dng", ".orf", ".rw2"}
 IMAGE_EXTENSIONS = PILLOW_EXTENSIONS | RAW_EXTENSIONS
-
-MODELS_DIR = Path.home() / ".photo_manager" / "models"
-
-MODELS = {
-    "fsrcnn_x2": {
-        "file": "FSRCNN_x2.pb",
-        "url": "https://github.com/Saafke/FSRCNN_Tensorflow/raw/master/models/FSRCNN_x2.pb",
-        "algo": "fsrcnn",
-        "scale": 2,
-        "desc": "FSRCNN ×2 — super-resolución ligera (40 KB)",
-    },
-    "espcn_x2": {
-        "file": "ESPCN_x2.pb",
-        "url": "https://github.com/Saafke/ESPCN_Tensorflow/raw/master/models/ESPCN_x2.pb",
-        "algo": "espcn",
-        "scale": 2,
-        "desc": "ESPCN ×2 — super-resolución rápida (100 KB)",
-    },
-}
 
 # Real-ESRGAN (binario ncnn-vulkan externo)
 REALESRGAN_ENV = "PHOTO_MANAGER_REALESRGAN"
@@ -150,12 +122,6 @@ TAG_DATETIME_ORIGINAL = 36867
 TAG_DATETIME_DIGITIZED = 36868
 TAG_DATETIME = 306            # IFD0: fecha de última modificación/edición
 TAG_ORIENTATION = 274
-
-MESES = {
-    1: "01-Enero", 2: "02-Febrero", 3: "03-Marzo", 4: "04-Abril",
-    5: "05-Mayo", 6: "06-Junio", 7: "07-Julio", 8: "08-Agosto",
-    9: "09-Septiembre", 10: "10-Octubre", 11: "11-Noviembre", 12: "12-Diciembre",
-}
 
 # ══════════════════════════════════════════════════
 # UTILIDADES
@@ -604,58 +570,6 @@ def get_image_info(filepath: Path, hash_size: int = 12,
         else:
             print(f"  ⚠ Error: {filepath.name} — {e}")
         return None
-
-
-# [FIX #16] download_model con timeout y archivo temporal
-def _validate_model_file(path: Path, info: dict) -> bool:
-    """Valida tamaño y que OpenCV pueda cargar/configurar la red."""
-    try:
-        if not path.is_file() or path.stat().st_size < 1024:
-            return False
-        if _SUPERRES:
-            test_sr = cv2.dnn_superres.DnnSuperResImpl_create()
-            test_sr.readModel(str(path))
-            test_sr.setModel(info["algo"], info["scale"])
-        return True
-    except Exception as exc:
-        print(f"  ⚠ Modelo inválido: {exc}")
-        return False
-
-
-def download_model(name: str) -> Path | None:
-    """Descarga un modelo IA si no existe localmente."""
-    info = MODELS.get(name)
-    if not info:
-        print(f"  ✗ Modelo desconocido: {name}")
-        return None
-    dest = MODELS_DIR / info["file"]
-    if dest.exists():
-        if _validate_model_file(dest, info):
-            return dest
-        print(f"  ⚠ Modelo local inválido; se descargará nuevamente: {dest}")
-        dest.unlink(missing_ok=True)
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"  Descargando {info['desc']}...")
-    tmp = f"{dest}.{os.getpid()}.tmp"
-    try:
-        req = urllib.request.Request(info["url"])
-        with urllib.request.urlopen(req, timeout=30) as resp, open(tmp, "wb") as out:
-            shutil.copyfileobj(resp, out)
-        if not _validate_model_file(Path(tmp), info):
-            raise ValueError("el archivo descargado no es un modelo válido")
-        os.replace(tmp, str(dest))
-        print(f"  ✓ Modelo descargado y validado por OpenCV: {dest}")
-        return dest
-    except Exception as e:
-        print(f"  ✗ Error descargando: {e}")
-        return None
-    finally:
-        # Limpiar .tmp huérfano (cubre KeyboardInterrupt que es BaseException)
-        try:
-            if os.path.exists(tmp) and not dest.exists():
-                os.unlink(tmp)
-        except OSError:
-            pass
 
 
 # [FIX #17] format_size con TB
@@ -1262,7 +1176,7 @@ def run_dedup(source: Path, output: Path, compare: Path | None = None,
 
 
 # ══════════════════════════════════════════════════
-# 3. MEJORA DE FOTOS (IA + OpenCV)
+# 3. MEJORA DE FOTOS
 # ══════════════════════════════════════════════════
 
 
@@ -1352,44 +1266,6 @@ def _save_pil(img: Image.Image, dst: Path, source: Path,
     return None, False
 
 
-def enhance_clahe(img):
-    """CLAHE en canal L (espacio LAB)."""
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-    return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-
-
-def enhance_white_balance(img):
-    """Balance de blancos — gray world."""
-    result = img.copy().astype("float64")
-    avg_b, avg_g, avg_r = [result[:, :, i].mean() for i in range(3)]
-    avg_all = (avg_b + avg_g + avg_r) / 3
-    result[:, :, 0] *= avg_all / max(avg_b, 1)
-    result[:, :, 1] *= avg_all / max(avg_g, 1)
-    result[:, :, 2] *= avg_all / max(avg_r, 1)
-    return result.clip(0, 255).astype("uint8")
-
-
-def enhance_gamma(img):
-    """Corrección de gamma adaptativa."""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    mean_lum = gray.mean()
-    if mean_lum < 80:
-        gamma = 0.6
-    elif mean_lum < 120:
-        gamma = 0.8
-    elif mean_lum > 200:
-        gamma = 1.4
-    elif mean_lum > 170:
-        gamma = 1.2
-    else:
-        return img
-    lut = np.array([((i / 255.0) ** gamma) * 255 for i in range(256)]).astype("uint8")
-    return cv2.LUT(img, lut)
-
-
 def enhance_denoise(img, strength: int = 6):
     """Reducción de ruido preservando detalle."""
     return cv2.fastNlMeansDenoisingColored(img, None, strength, strength, 7, 21)
@@ -1399,15 +1275,6 @@ def enhance_sharpen(img, amount: float = 0.5):
     """Unsharp mask."""
     blurred = cv2.GaussianBlur(img, (0, 0), 3)
     return cv2.addWeighted(img, 1 + amount, blurred, -amount, 0)
-
-
-def _make_superres(model_name: str, model_path: Path):
-    """Crea y configura UNA vez la red de super-resolución de OpenCV."""
-    info = MODELS[model_name]
-    sr = cv2.dnn_superres.DnnSuperResImpl_create()
-    sr.readModel(str(model_path))
-    sr.setModel(info["algo"], info["scale"])
-    return sr
 
 
 _REALESRGAN_NAMES = ("realesrgan-ncnn-vulkan", "realesrgan-ncnn-vulkan.exe")
@@ -1480,6 +1347,10 @@ UPSCALE_TARGETS = {
     "x4":     {"label": "×4 (máximo)",         "factor": 4.0,       "suffix": "_x4"},
 }
 DEFAULT_TARGET = "fullhd"
+# "Máximo" del menú: 4K con tope ×4. Las fotos pequeñas se amplían todo lo
+# que da el modelo; las que ya son 4K o más no se tocan. (×4 literal en una
+# foto de 12 MP daría 192 MP: archivos de ~100 MB y horas de GPU.)
+AUTO_TARGET = "4k"
 REALESRGAN_MAX_SCALE = 4.0   # el modelo x4plus no da más de ×4
 AUTO_MIN_UPSCALE = 1.25      # en modo auto, no vale la pena ampliar menos
 
@@ -1651,6 +1522,7 @@ HDR_LEVELS = {
     "fuerte": (0.40, 1.0),
 }
 DEFAULT_HDR = "normal"
+AUTO_HDR = "fuerte"        # intensidad del HDR en el modo automático
 HDR_WEIGHT_MAX_PX = 2_000_000   # resolución máx. para calcular los pesos
 
 
@@ -1979,15 +1851,6 @@ def _auto_report_row(path: Path, a: dict, actions: list[str]) -> dict:
     }
 
 
-ENHANCE_FILTERS = {
-    "clahe": enhance_clahe,
-    "denoise": lambda img: enhance_denoise(img, strength=8),
-    "gamma": enhance_gamma,
-    "sharpen": lambda img: enhance_sharpen(img, amount=0.6),
-    "hdr": enhance_hdr,
-}
-
-
 def _oriented_size(path: Path) -> tuple[int, int]:
     """Tamaño tal como se ve la foto (orientación EXIF aplicada), sin decodificar."""
     with Image.open(path) as img:
@@ -2029,10 +1892,8 @@ def _enhance_task(job: dict) -> dict:
                 shutil.copy2(str(src), str(dst))
                 res["status"] = "copied"
                 return res
-        elif mode == "hdr":
+        else:                       # mode == "hdr"
             arr = enhance_hdr(arr, job["hdr"])
-        else:
-            arr = ENHANCE_FILTERS[mode](arr)
         written, meta_ok = _save_pil(_bgr_to_pil(arr), dst, src)
         if not written:
             raise OSError(f"no se pudo escribir {dst.name}")
@@ -2047,9 +1908,8 @@ def run_enhance(source: Path, output: Path, mode: str,
                 hdr: str = DEFAULT_HDR):
     """Ejecuta mejora de fotos.
 
-    Modos: auto, diagnose, clahe, denoise, gamma, sharpen (OpenCV);
-    superres_fsrcnn, superres_espcn (OpenCV dnn_superres, ×2 fijo);
-    realesrgan (binario externo realesrgan-ncnn-vulkan).
+    Modos: auto (analiza y corrige solo lo necesario), diagnose (solo
+    reporte), realesrgan (super-resolución) y hdr (aclarar sombras).
     `target` (clave de UPSCALE_TARGETS): resolución final para Real-ESRGAN,
     tanto en el modo realesrgan como en auto.
 
@@ -2070,7 +1930,7 @@ def run_enhance(source: Path, output: Path, mode: str,
     if not _validate_source_output(source, output):
         return
 
-    sr = esrgan = None
+    esrgan = None
     if mode == "realesrgan":
         esrgan = find_realesrgan()
         if not esrgan:
@@ -2078,20 +1938,9 @@ def run_enhance(source: Path, output: Path, mode: str,
             print("    Descárgalo de https://github.com/xinntao/Real-ESRGAN/releases")
             print(f"    y descomprímelo en {SCRIPT_DIR / 'realesrgan'}")
             return
-    elif mode.startswith("superres"):
-        if not _SUPERRES:
-            print("  ✗ dnn_superres no disponible. Necesitas opencv-contrib-python==4.10.0.84")
-            return
-        # [v1.3 H6] Descargar y cargar el modelo UNA vez antes del loop
-        model_name = "espcn_x2" if mode == "superres_espcn" else "fsrcnn_x2"
-        model_path = download_model(model_name)
-        if not model_path:
-            print("  ✗ No se pudo obtener el modelo. Abortando.")
-            return
-        sr = _make_superres(model_name, model_path)
     elif mode in ("auto", "diagnose"):
         esrgan = find_realesrgan()   # opcional: solo para lo que no llega al objetivo
-    elif mode not in ENHANCE_FILTERS:
+    elif mode != "hdr":
         print(f"  ✗ Modo desconocido: {mode}")
         return
 
@@ -2108,7 +1957,7 @@ def run_enhance(source: Path, output: Path, mode: str,
     if esrgan:
         print(f"  Resolución final: {UPSCALE_TARGETS[target]['label']}")
     print()
-    suffix = "_x2" if sr is not None else UPSCALE_TARGETS[target]["suffix"]
+    suffix = UPSCALE_TARGETS[target]["suffix"]
 
     # Destinos (calculados en el proceso principal: sin carreras de nombres)
     jobs = []
@@ -2118,8 +1967,7 @@ def run_enhance(source: Path, output: Path, mode: str,
         except ValueError:
             rel = Path(img_path.name)
         plain = output / rel
-        upscale_mode = mode == "realesrgan" or sr is not None
-        dst = plain.with_stem(plain.stem + suffix) if upscale_mode else plain
+        dst = plain.with_stem(plain.stem + suffix) if mode == "realesrgan" else plain
         dst.parent.mkdir(parents=True, exist_ok=True)
         jobs.append({"src": img_path, "dst": _unique_path(dst), "plain": plain,
                      "mode": mode, "target": target, "esrgan": esrgan, "hdr": hdr})
@@ -2162,23 +2010,6 @@ def run_enhance(source: Path, output: Path, mode: str,
                 ok += 1
             else:
                 esrgan_jobs.append((job, None))
-    elif sr is not None:
-        progress = Progress(len(jobs), "Super-resolución")
-        for i, job in enumerate(jobs):
-            progress.update(i, job["src"].name, force=True)
-            try:
-                arr = _pil_to_bgr(_load_oriented_rgb(job["src"]))
-                h, w = arr.shape[:2]
-                if h < 8 or w < 8:
-                    raise ValueError(f"demasiado pequeña para superres ({w}x{h})")
-                written, meta_ok = _save_pil(_bgr_to_pil(sr.upsample(arr)),
-                                             job["dst"], job["src"])
-                if not written:
-                    raise OSError(f"no se pudo escribir {job['dst'].name}")
-                record({"status": "ok", "meta_ok": meta_ok, "row": None})
-            except Exception as e:
-                record({"status": "error", "error": f"{job['src'].name}: {e}"})
-        progress.finish()
     else:
         label = "Analizando" if diagnose_only else "Procesando"
         for i, res in parallel_map(_enhance_task, jobs, label, workers=workers,
@@ -2289,81 +2120,7 @@ def run_enhance(source: Path, output: Path, mode: str,
 
 
 # ══════════════════════════════════════════════════
-# 4. ORGANIZAR POR FECHA
-# ══════════════════════════════════════════════════
-
-
-def run_organize(source: Path, output: Path, move: bool = False):
-    """Organiza fotos en carpetas Año/Mes."""
-    source, output = source.expanduser().resolve(), output.expanduser().resolve()
-    if not _validate_source_output(source, output):
-        return
-    images = find_images(source, exclude=output)
-    if not images:
-        print("  No se encontraron imágenes.")
-        return
-
-    _prepare_output_dir(output)
-    organized = 0
-    no_date = 0
-
-    progress = Progress(len(images), "Organizando")
-    for i, img_path in enumerate(images, 1):
-        progress.update(i - 1, img_path.name)
-        date = get_photo_date(img_path)
-        if date:
-            # [FIX #22] Validar año razonable
-            year = date.year
-            if year < 1900 or year > 2100:
-                folder = output / "Sin_fecha"
-                no_date += 1
-            else:
-                folder = output / str(year) / MESES.get(date.month, f"{date.month:02d}")
-        else:
-            folder = output / "Sin_fecha"
-            no_date += 1
-
-        folder.mkdir(parents=True, exist_ok=True)
-        dst = folder / img_path.name
-
-        # [FIX #14] Skip si dst == src (ya organizado)
-        if str(dst) == str(img_path) or dst.resolve() == img_path.resolve():
-            organized += 1
-            continue
-
-        dst = _unique_path(dst)
-
-        try:
-            if move:
-                shutil.move(str(img_path), str(dst))
-            else:
-                shutil.copy2(str(img_path), str(dst))
-            organized += 1
-        except Exception as e:
-            print(f"  ⚠ {img_path.name}: {e}")
-
-
-    progress.finish()
-    action = "movidas" if move else "copiadas"
-    print(f"\n  ✓ {organized} fotos {action}")
-    if no_date:
-        print(f"  ℹ {no_date} sin fecha válida → Sin_fecha/")
-    print(f"  ✓ Resultado en: {output}")
-
-    # Limpiar directorios vacíos si movimos
-    if move:
-        for dp, _, _ in os.walk(source, topdown=False):
-            p = Path(dp)
-            if p != source and p != output and not _is_managed_dir(p):
-                try:
-                    if not any(p.iterdir()):
-                        p.rmdir()
-                except Exception:
-                    pass
-
-
-# ══════════════════════════════════════════════════
-# 5. DETECTAR FOTOS BORROSAS
+# 4. DETECTAR FOTOS BORROSAS
 # ══════════════════════════════════════════════════
 
 
@@ -2503,7 +2260,7 @@ def run_blur_detect(source: Path, threshold: float = 100.0,
 
 
 # ══════════════════════════════════════════════════
-# 6. COMPRIMIR / CONVERTIR
+# 5. COMPRIMIR / CONVERTIR
 # ══════════════════════════════════════════════════
 
 
@@ -2610,139 +2367,6 @@ def run_compress(source: Path, output: Path, fmt: str = "heif",
 
 
 # ══════════════════════════════════════════════════
-# 7. ESTADÍSTICAS
-# ══════════════════════════════════════════════════
-
-
-def run_stats(source: Path):
-    """Muestra estadísticas; distingue archivos encontrados de imágenes legibles."""
-    source = source.expanduser().resolve()
-    images = find_images(source, warn_raw=False)
-
-    raw_files = []
-    for dp, filenames in _walk_files(source):
-        for fname in filenames:
-            if Path(fname).suffix.lower() in RAW_EXTENSIONS:
-                raw_files.append(dp / fname)
-
-    if not images and not raw_files:
-        print("  No se encontraron imágenes ni archivos RAW.")
-        return
-
-    total_size = 0
-    formats = defaultdict(int)
-    res_buckets = {"< 2 MP": 0, "2-8 MP": 0, "8-20 MP": 0, "> 20 MP": 0}
-    dates = []
-    folders = set()
-    readable_count = 0
-    unreadable = []
-
-    progress = Progress(len(images), "Leyendo")
-    for i, img_path in enumerate(images, 1):
-        progress.update(i - 1, img_path.name)
-        # 1) stat: puede fallar por permisos / archivo borrado
-        try:
-            size = img_path.stat().st_size
-        except OSError:
-            unreadable.append(img_path)
-            continue
-        total_size += size
-        formats[img_path.suffix.lower()] += 1
-        folders.add(str(img_path.parent))
-
-        # 2) validación de cabecera rápida con verify(); no decodifica píxeles.
-        try:
-            with Image.open(img_path) as check:
-                check.verify()
-        except Exception:
-            unreadable.append(img_path)
-            continue
-        readable_count += 1
-
-        # 3) metadata (resolución y fecha) sin forzar decode completo.
-        try:
-            with Image.open(img_path) as img:
-                mp = (img.size[0] * img.size[1]) / 1e6
-                if mp < 2:
-                    res_buckets["< 2 MP"] += 1
-                elif mp < 8:
-                    res_buckets["2-8 MP"] += 1
-                elif mp < 20:
-                    res_buckets["8-20 MP"] += 1
-                else:
-                    res_buckets["> 20 MP"] += 1
-
-                date = resolve_photo_date(img_path, img.getexif())
-                if date:
-                    dates.append(date)
-        except Exception:
-            # Cabecera OK pero metadata ilegible: no es "unreadable" total,
-            # pero no podemos bucketizar. Lo dejamos fuera de resolución/fecha.
-            pass
-
-
-    progress.finish()
-
-    raw_total_size = 0
-    for rp in raw_files:
-        try:
-            sz = rp.stat().st_size
-            raw_total_size += sz
-            total_size += sz
-            formats[rp.suffix.lower()] += 1
-            folders.add(str(rp.parent))
-        except OSError:
-            pass
-
-    total_count = len(images) + len(raw_files)
-    banner(f"ESTADÍSTICAS: {source.name}")
-    print(f"  Total de archivos: {total_count:,}")
-    print(f"    Imágenes: {len(images):,} | Legibles: {readable_count:,} | RAW: {len(raw_files):,}")
-    if unreadable:
-        print(f"    No accesibles/ilegibles: {len(unreadable):,}")
-        for path in unreadable[:5]:
-            print(f"      - {path.name}")
-        if len(unreadable) > 5:
-            print(f"      ... y {len(unreadable) - 5} más")
-    print(f"  Tamaño total:      {format_size(total_size)}")
-    if raw_files:
-        print(f"    (RAW: {format_size(raw_total_size)})")
-    print(f"  Carpetas:          {len(folders)}")
-    print()
-
-    print("  Formatos:")
-    for ext, count in sorted(formats.items(), key=lambda x: -x[1]):
-        pct = count * 100 / max(total_count, 1)
-        print(f"    {ext:8s} {count:6d}  ({pct:.0f}%)")
-    print()
-
-    if readable_count:
-        print("  Resoluciones (sobre imágenes legibles):")
-        for label, count in res_buckets.items():
-            bar = "█" * (count * 30 // max(readable_count, 1))
-            print(f"    {label:8s} {count:6d}  {bar}")
-        print()
-    elif images:
-        print("  Resoluciones: no disponibles (ninguna imagen pudo leerse).")
-    else:
-        print("  Resoluciones: no disponibles (solo archivos RAW).")
-
-    valid_dates = sorted(d for d in dates if 1900 <= d.year <= 2100)
-    if valid_dates:
-        print(f"  Rango de fechas: {valid_dates[0].strftime('%Y-%m-%d')}"
-              f" → {valid_dates[-1].strftime('%Y-%m-%d')}")
-        years = defaultdict(int)
-        for d in valid_dates:
-            years[d.year] += 1
-        print("  Por año:")
-        for year in sorted(years):
-            bar = "█" * (years[year] * 30 // max(max(years.values()), 1))
-            print(f"    {year}  {years[year]:6d}  {bar}")
-    elif raw_files and not images:
-        print("  ℹ Fechas no calculadas (solo archivos RAW encontrados)")
-
-
-# ══════════════════════════════════════════════════
 # MENÚ INTERACTIVO
 # ══════════════════════════════════════════════════
 
@@ -2792,12 +2416,12 @@ def menu_compare():
 
 
 def menu_enhance():
-    banner("MEJORAR FOTOS (OpenCV / super-resolución)")
-    esrgan = find_realesrgan()
-    if not _CV2 and not esrgan:
-        print("  ✗ Requiere OpenCV o Real-ESRGAN. Instala:")
+    banner("MEJORAR FOTOS")
+    if not _CV2:
+        print("  ✗ Requiere OpenCV. Instala:")
         print("    pip install opencv-contrib-python==4.10.0.84")
         return
+    esrgan = find_realesrgan()
 
     source = ask_folder("Carpeta de fotos")
     if not source:
@@ -2806,32 +2430,17 @@ def menu_enhance():
     if not output:
         output = source / "MEJORADAS"
 
-    cv_tag = "" if _CV2 else " (no disponible)"
-    sr_tag = "" if _SUPERRES else " (no disponible)"
-    es_tag = " (recomendado)" if esrgan else " (no instalado)"
+    es_tag = "" if esrgan else " (Real-ESRGAN no instalado)"
     print(f"""
   Modos de mejora:
-    1. Automático inteligente (analiza cada foto y corrige solo lo necesario,
-       incluye HDR en fotos oscuras){cv_tag}
-    2. Super-resolución Real-ESRGAN: elegir Full HD / 2K / 4K{es_tag}
-    3. Super-resolución ×2 FSRCNN (ligera){sr_tag}
-    4. Super-resolución ×2 ESPCN (ligera){sr_tag}
-    5. Reducir ruido{cv_tag}
-    6. Corregir contraste (CLAHE){cv_tag}
-    7. Corregir iluminación (gamma){cv_tag}
-    8. Aumentar nitidez (sharpen){cv_tag}
-    9. Solo diagnosticar (no modifica nada, genera reporte){cv_tag}
-   10. HDR: aclarar sombras sin quemar luces (a todas){cv_tag}
-
-  ℹ FSRCNN/ESPCN apenas superan a un reescalado bicúbico en fotos reales.
+    1. Automático: analiza cada foto y corrige solo lo necesario
+       (amplía hasta {UPSCALE_TARGETS[AUTO_TARGET]['label']}, HDR {AUTO_HDR} en fotos oscuras){es_tag}
+    2. Real-ESRGAN: ampliar hasta {UPSCALE_TARGETS[AUTO_TARGET]['label']} (máx. ×4){es_tag}
+    3. HDR: aclarar sombras sin quemar luces (a todas)
+    4. Solo diagnosticar (no modifica nada, genera reporte)
 """)
-    opt = ask("Modo", "2" if esrgan else "1")
-    mode_map = {
-        "1": "auto", "2": "realesrgan", "3": "superres_fsrcnn",
-        "4": "superres_espcn", "5": "denoise", "6": "clahe",
-        "7": "gamma", "8": "sharpen", "9": "diagnose", "10": "hdr",
-    }
-    mode = mode_map.get(opt)
+    opt = ask("Modo", "1")
+    mode = {"1": "auto", "2": "realesrgan", "3": "hdr", "4": "diagnose"}.get(opt)
     if not mode:
         print("  Opción no válida.")
         return
@@ -2841,30 +2450,15 @@ def menu_enhance():
         print("    https://github.com/xinntao/Real-ESRGAN/releases")
         print(f"    y descomprímelo en {SCRIPT_DIR / 'realesrgan'}")
         return
-    if mode.startswith("superres") and not _SUPERRES:
-        print("  ✗ dnn_superres no disponible. Instala opencv-contrib-python==4.10.0.84")
-        return
-    if mode != "realesrgan" and not _CV2:
-        print("  ✗ Este modo requiere OpenCV.")
-        return
 
-    target = DEFAULT_TARGET
-    if mode == "realesrgan":
-        target = ask_target(include_factors=True)
-    elif mode in ("auto", "diagnose") and esrgan:
-        print("  Las fotos que no lleguen a esta resolución se ampliarán con Real-ESRGAN;")
-        print("  las que ya la tienen no se amplían.")
-        target = ask_target(include_factors=False)
-    if not target:
-        return
-
-    hdr = DEFAULT_HDR
-    if mode in ("auto", "diagnose", "hdr"):
+    # Automático, Real-ESRGAN y diagnóstico: sin preguntas, al máximo útil.
+    hdr = AUTO_HDR
+    if mode == "hdr":
         hdr = ask_hdr_level()
         if not hdr:
             return
 
-    run_enhance(source, output, mode, target=target, hdr=hdr)
+    run_enhance(source, output, mode, target=AUTO_TARGET, hdr=hdr)
 
 
 def ask_hdr_level() -> str | None:
@@ -2882,35 +2476,6 @@ def ask_hdr_level() -> str | None:
         return None
 
 
-def ask_target(include_factors: bool) -> str | None:
-    """Pregunta la resolución final de las fotos ampliadas."""
-    keys = [k for k, v in UPSCALE_TARGETS.items()
-            if include_factors or "box" in v]
-    print("\n  Resolución final:")
-    for n, key in enumerate(keys, 1):
-        print(f"    {n}. {UPSCALE_TARGETS[key]['label']}")
-    default = str(keys.index(DEFAULT_TARGET) + 1)
-    opt = ask("Resolución", default)
-    try:
-        return keys[int(opt) - 1]
-    except (ValueError, IndexError):
-        print("  Opción no válida.")
-        return None
-
-
-def menu_organize():
-    banner("ORGANIZAR POR FECHA")
-    source = ask_folder("Carpeta de fotos")
-    if not source:
-        return
-    output = ask_folder("Carpeta de salida (Enter = auto)", must_exist=False)
-    if not output:
-        output = source / "ORGANIZADAS"
-    move = ask_confirm("¿Mover archivos? (No = copiar)", default_yes=False)
-    run_organize(source, output, move=move)
-
-
-# [FIX #8] menu_blur con try/except en float
 def menu_blur():
     banner("DETECTAR FOTOS BORROSAS")
     source = ask_folder("Carpeta de fotos")
@@ -2957,14 +2522,6 @@ def menu_compress():
     run_compress(source, output, fmt=fmt, quality=quality)
 
 
-def menu_stats():
-    banner("ESTADÍSTICAS")
-    source = ask_folder("Carpeta de fotos")
-    if not source:
-        return
-    run_stats(source)
-
-
 def main_menu():
     while True:
         cls()
@@ -2973,8 +2530,6 @@ def main_menu():
             deps.append("HEIF")
         if _CV2:
             deps.append("OpenCV")
-        if _SUPERRES:
-            deps.append("SuperRes")
         if find_realesrgan():
             deps.append("ESRGAN")
         dep_str = " + ".join(deps) if deps else "solo Pillow"
@@ -2986,16 +2541,14 @@ def main_menu():
 ║                                              ║
 ║  1. Deduplicar fotos                         ║
 ║  2. Comparar dos carpetas                    ║
-║  3. Mejorar fotos (OpenCV / super-res.)      ║
-║  4. Organizar por fecha                      ║
-║  5. Detectar fotos borrosas                  ║
-║  6. Comprimir / Convertir                    ║
-║  7. Estadísticas de carpeta                  ║
+║  3. Mejorar fotos (IA / HDR)                 ║
+║  4. Detectar fotos borrosas                  ║
+║  5. Comprimir / Convertir                    ║
 ║                                              ║
 ║  0. Salir                                    ║
 ║                                              ║
 ╠══════════════════════════════════════════════╣
-║  Módulos: {dep_str:<34s}║
+║  Módulos: {dep_str:<35s}║
 ╚══════════════════════════════════════════════╝
 """)
         opt = input("  Opción: ").strip()
@@ -3010,17 +2563,13 @@ def main_menu():
         elif opt == "3":
             menu_enhance()
         elif opt == "4":
-            menu_organize()
-        elif opt == "5":
             menu_blur()
-        elif opt == "6":
+        elif opt == "5":
             menu_compress()
-        elif opt == "7":
-            menu_stats()
         else:
             print("  Opción no válida.")
 
-        if opt in ("1", "2", "3", "4", "5", "6", "7"):
+        if opt in ("1", "2", "3", "4", "5"):
             print()
             input("  Enter para volver al menú...")
 
