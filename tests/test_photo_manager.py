@@ -349,3 +349,116 @@ def test_ask_folder_accepts_quoted_dragged_path(tmp_path, monkeypatch):
     d.mkdir()
     monkeypatch.setattr("builtins.input", lambda _: f"'{d}' ")
     assert pm.ask_folder("Carpeta") == d.resolve()
+
+
+# ──────────────────────────────────────────────────────────────
+# Modo automático adaptativo
+# ──────────────────────────────────────────────────────────────
+
+def photo(w=2000, h=1500, gray_share=0.4, base=None, seed=0):
+    """Foto sintética nítida: bloques grises neutros + bloques de color (BGR)."""
+    rng = np.random.default_rng(seed)
+    bh, bw = h // 25, w // 25
+    lum = rng.integers(30, 230, (bh, bw, 1))
+    img = np.repeat(lum, 3, axis=2).astype(np.int32)
+    color = rng.random((bh, bw)) > gray_share
+    hue = (np.broadcast_to(np.array(base), (bh, bw, 3)) if base is not None
+           else rng.integers(0, 256, (bh, bw, 3)))
+    img[color] = hue[color]
+    small = np.clip(img, 0, 255).astype(np.uint8)
+    return np.asarray(Image.fromarray(small).resize((w, h), Image.Resampling.NEAREST))
+
+
+def kinds(actions):
+    return {a.split(" (")[0] for a in actions}
+
+
+def test_auto_leaves_good_photo_untouched():
+    g = photo()
+    out, _, actions = pm.enhance_adaptive(g)
+    assert actions == []
+    assert np.array_equal(out, g)
+
+
+@pytest.mark.parametrize("name, base", [
+    ("bosque", [40, 150, 50]),
+    ("atardecer", [30, 110, 240]),
+])
+def test_auto_does_not_neutralize_intentional_colors(name, base):
+    img = photo(gray_share=0.15, base=base)
+    _, _, actions = pm.enhance_adaptive(img)
+    assert "corregir dominante de color" not in kinds(actions), name
+
+
+def test_auto_corrects_real_color_cast():
+    img = np.clip(photo().astype(int) + [-12, 0, 22], 0, 255).astype(np.uint8)
+    out, before, actions = pm.enhance_adaptive(img)
+    assert "corregir dominante de color" in kinds(actions)
+    assert pm.analyze_image(out)["cast"] < before["cast"] / 2
+
+
+def test_auto_reduces_noise_only_when_noisy():
+    rng = np.random.default_rng(1)
+    g = photo()
+    noisy = np.clip(g + rng.normal(0, 12, g.shape), 0, 255).astype(np.uint8)
+    out, before, actions = pm.enhance_adaptive(noisy)
+    assert "reducir ruido" in kinds(actions)
+    assert pm.analyze_image(out)["noise"] < before["noise"] / 2
+
+
+def test_auto_fixes_dark_and_flat():
+    g = photo()
+    for img in ((g * 0.35).astype(np.uint8), (g * 0.5 + 64).astype(np.uint8)):
+        out, before, actions = pm.enhance_adaptive(img)
+        after = pm.analyze_image(out)
+        assert "ampliar rango tonal" in kinds(actions)
+        assert after["range"] > before["range"] * 1.4
+        assert 90 <= after["mean"] <= 185
+
+
+def test_auto_sharpens_soft_photo():
+    import cv2
+    soft = cv2.GaussianBlur(photo(), (0, 0), 3)
+    out, before, actions = pm.enhance_adaptive(soft)
+    assert "enfocar" in kinds(actions)
+    assert pm.analyze_image(out)["sharpness"] > before["sharpness"]
+
+
+def test_auto_upscales_low_res_with_esrgan(tmp_path):
+    exe = tmp_path / "realesrgan-ncnn-vulkan"
+    exe.write_text(FAKE_ESRGAN.format(python=sys.executable))
+    exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
+    small = photo(800, 600)
+    out, _, actions = pm.enhance_adaptive(small, esrgan=exe)
+    assert "super-resolución ×2" in kinds(actions)
+    assert out.shape[:2] == (1200, 1600)
+
+
+def test_diagnose_mode_writes_report_and_no_images(tmp_path):
+    src, out = tmp_path / "src", tmp_path / "out"
+    src.mkdir()
+    Image.fromarray(photo()[:, :, ::-1]).save(src / "buena.jpg", quality=95)
+    Image.fromarray((photo(seed=2) * 0.35).astype(np.uint8)).save(src / "oscura.jpg")
+    pm.run_enhance(src, out, "diagnose")
+    assert not list(out.glob("*.jpg"))
+    with open(out / "mejora_reporte.csv", encoding="utf-8") as f:
+        rows = {Path(r["archivo"]).name: r for r in csv.DictReader(f)}
+    assert rows["buena.jpg"]["acciones"].startswith("ninguna")
+    assert "ampliar rango tonal" in rows["oscura.jpg"]["acciones"]
+
+
+def test_auto_run_writes_images_and_report(tmp_path):
+    src, out = tmp_path / "src", tmp_path / "out"
+    src.mkdir()
+    Image.fromarray((photo() * 0.35).astype(np.uint8)).save(src / "oscura.jpg", quality=95)
+    pm.run_enhance(src, out, "auto")
+    assert (out / "oscura.jpg").exists()
+    assert (out / "mejora_reporte.csv").exists()
+
+
+def test_auto_copies_untouched_photos_byte_for_byte(tmp_path):
+    src, out = tmp_path / "src", tmp_path / "out"
+    src.mkdir()
+    Image.fromarray(photo()[:, :, ::-1]).save(src / "buena.jpg", quality=92)
+    pm.run_enhance(src, out, "auto")
+    assert (out / "buena.jpg").read_bytes() == (src / "buena.jpg").read_bytes()

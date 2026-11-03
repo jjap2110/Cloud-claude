@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Photo Manager CLI v1.7.1
+Photo Manager CLI v1.8.0
 Herramienta completa de gestión de fotos.
 
 Funcionalidades:
   1. Deduplicar fotos (pHash + BK-tree + complete-link, caché SQLite)
   2. Comparar dos carpetas en busca de duplicados cruzados
-  3. Mejorar fotos: ajustes OpenCV, super-resolución FSRCNN/ESPCN y
+  3. Mejorar fotos: modo automático que analiza cada foto (ruido, exposición,
+     rango tonal, dominante de color, nitidez, resolución) y corrige solo lo
+     necesario; ajustes OpenCV sueltos; super-resolución FSRCNN/ESPCN y
      Real-ESRGAN (opcional, binario externo realesrgan-ncnn-vulkan)
   4. Organizar por fecha (Año/Mes: EXIF captura → nombre de archivo → mtime)
   5. Detectar fotos borrosas (varianza del Laplaciano, resolución normalizada)
@@ -91,7 +93,7 @@ if _CV2:
 # CONSTANTES
 # ══════════════════════════════════════════════════
 
-VERSION = "1.7.1"
+VERSION = "1.8.0"
 
 # [FIX #12] Separar formatos soportados por Pillow vs RAW
 PILLOW_EXTENSIONS = {
@@ -1278,18 +1280,189 @@ def realesrgan_upscale(img: Image.Image, exe: Path, out_scale: int = 2,
             return up
 
 
-def enhance_auto(img):
-    """Pipeline completo: denoise → WB → CLAHE → gamma → sharpen."""
-    img = enhance_denoise(img, strength=4)
-    img = enhance_white_balance(img)
-    img = enhance_clahe(img)
-    img = enhance_gamma(img)
-    img = enhance_sharpen(img, amount=0.4)
-    return img
+# ── Modo automático adaptativo ────────────────────
+# Umbrales calibrados con imágenes sintéticas, NO con una biblioteca real.
+# Si el diagnóstico (mejora_reporte.csv) no coincide con tu criterio, ajústalos.
+AUTO_LOWRES_SIDE = 1600   # lado mayor (px) por debajo → baja resolución
+AUTO_NOISE_SIGMA = 4.0    # ruido estimado (σ en escala 0-255)
+AUTO_DARK_MEAN = 90       # luminancia media por debajo → subexpuesta
+AUTO_BRIGHT_MEAN = 185    # luminancia media por encima → sobreexpuesta
+AUTO_LOW_RANGE = 170      # rango tonal p0.5–p99.5 por debajo → plana/lavada
+AUTO_CAST = 5.0           # tinte medio de los píxeles neutros (a/b en LAB)
+AUTO_NEUTRAL_CHROMA = 22  # croma máx. para considerar un píxel "casi neutro"
+AUTO_NEUTRAL_MIN_SHARE = 0.05  # mínimo de neutros (5 %) para poder juzgar
+AUTO_SOFT = 100.0         # varianza del Laplaciano a 1000 px → poco nítida
+
+
+def estimate_noise(gray) -> float:
+    """σ del ruido (método de Immerkær) medido solo en zonas lisas.
+
+    Los bordes y texturas se excluyen (30 % de píxeles con menor gradiente)
+    para no confundir detalle con ruido.
+    """
+    h, w = gray.shape[:2]
+    if h < 16 or w < 16:
+        return 0.0
+    # Recorte central para fotos grandes: el ruido es homogéneo
+    if h * w > 4_000_000:
+        cy, cx, r = h // 2, w // 2, 1024
+        gray = gray[max(cy - r, 0):cy + r, max(cx - r, 0):cx + r]
+    g = gray.astype(np.float64)
+    kernel = np.array([[1, -2, 1], [-2, 4, -2], [1, -2, 1]], dtype=np.float64)
+    resp = np.abs(cv2.filter2D(g, -1, kernel, borderType=cv2.BORDER_REFLECT))
+    grad = np.hypot(cv2.Sobel(g, cv2.CV_64F, 1, 0), cv2.Sobel(g, cv2.CV_64F, 0, 1))
+    flat = grad <= np.percentile(grad, 30)
+    if flat.sum() < 100:
+        return 0.0
+    return float(math.sqrt(math.pi / 2) * resp[flat].mean() / 6)
+
+
+def analyze_image(bgr) -> dict:
+    """Mide lo que la foto necesita: resolución, ruido, exposición,
+    rango tonal, dominante de color y nitidez."""
+    h, w = bgr.shape[:2]
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    lum = lab[:, :, 0]
+    p_lo, p_hi = (float(v) for v in np.percentile(lum, (0.5, 99.5)))
+
+    # Dominante de color: se mide SOLO en píxeles casi neutros de tonos medios.
+    # Una foto de bosque o un atardecer tiene media verde/naranja pero sus
+    # grises siguen siendo grises; con una dominante real, los grises se tiñen.
+    # (El "gray world" de v1.6 promediaba toda la foto y neutralizaba eso.)
+    a_ch = lab[:, :, 1].astype(np.float32) - 128
+    b_ch = lab[:, :, 2].astype(np.float32) - 128
+    mid = (lum > 40) & (lum < 230)
+    neutral = mid & (np.hypot(a_ch, b_ch) < AUTO_NEUTRAL_CHROMA)
+    neutral_share = float(neutral.sum()) / max(int(mid.sum()), 1)
+    if neutral.sum() > 500 and neutral_share >= AUTO_NEUTRAL_MIN_SHARE:
+        da = float(a_ch[neutral].mean())
+        db = float(b_ch[neutral].mean())
+    else:
+        da = db = 0.0          # sin suficientes neutros: no se puede saber
+
+    small = gray
+    if max(h, w) > BLUR_MAX_SIDE:
+        f = BLUR_MAX_SIDE / max(h, w)
+        small = cv2.resize(gray, (max(1, round(w * f)), max(1, round(h * f))),
+                           interpolation=cv2.INTER_AREA)
+
+    return {
+        "width": w, "height": h,
+        "low_res": max(w, h) < AUTO_LOWRES_SIDE,
+        "noise": estimate_noise(gray),
+        "mean": float(lum.mean()),
+        "p_lo": p_lo, "p_hi": p_hi, "range": p_hi - p_lo,
+        "da": da, "db": db, "cast": math.hypot(da, db),
+        "sharpness": float(cv2.Laplacian(small, cv2.CV_64F).var()),
+    }
+
+
+def _lab_apply(bgr, fn):
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    fn(lab)
+    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
+def _correct_cast(bgr, da: float, db: float, strength: float = 0.7):
+    """Desplaza a/b en LAB hacia el neutro (parcial: respeta tonos cálidos)."""
+    def fn(lab):
+        lab[:, :, 1] -= da * strength
+        lab[:, :, 2] -= db * strength
+    return _lab_apply(bgr, fn)
+
+
+def _stretch_levels(bgr, p_lo: float, p_hi: float, max_gain: float = 1.6):
+    """Estira la luminancia p_lo→0 y p_hi→255 (solo L: no altera el color)."""
+    span = max(p_hi - p_lo, 1.0)
+    gain = min(255.0 / span, max_gain)
+    center = (p_lo + p_hi) / 2
+
+    def fn(lab):
+        lab[:, :, 0] = (lab[:, :, 0] - center) * gain + 127.5
+    return _lab_apply(bgr, fn)
+
+
+def _gamma_toward(bgr, mean: float, target: float = 118.0, amount: float = 0.6):
+    """Gamma en L que acerca la media a `target`, solo parcialmente."""
+    mean = min(max(mean, 1.0), 254.0)
+    gamma = math.log(target / 255) / math.log(mean / 255)
+    gamma = 1 + amount * (gamma - 1)
+    gamma = min(max(gamma, 0.55), 1.6)
+    lut = np.array([((i / 255.0) ** gamma) * 255 for i in range(256)],
+                   dtype=np.float32)
+
+    def fn(lab):
+        lab[:, :, 0] = lut[lab[:, :, 0].astype(np.uint8)]
+    return _lab_apply(bgr, fn)
+
+
+def enhance_adaptive(bgr, esrgan: Path | None = None, dry_run: bool = False):
+    """Analiza la foto y aplica solo las correcciones que necesita.
+
+    Retorna (imagen BGR, análisis, lista de acciones legibles).
+    Orden: super-resolución → ruido → color → rango → exposición → nitidez.
+    Con dry_run=True decide igual pero omite los pasos lentos (super-
+    resolución y reducción de ruido); sirve para el modo diagnóstico.
+    """
+    a = analyze_image(bgr)
+    actions = []
+
+    upscaled = False
+    if a["low_res"] and esrgan:
+        # Real-ESRGAN además limpia ruido y artefactos JPEG
+        if not dry_run:
+            bgr = _pil_to_bgr(realesrgan_upscale(_bgr_to_pil(bgr), esrgan))
+        actions.append(f"super-resolución ×2 ({a['width']}x{a['height']} → "
+                       f"{a['width'] * 2}x{a['height'] * 2})")
+        upscaled = True
+
+    if not upscaled and a["noise"] > AUTO_NOISE_SIGMA:
+        strength = int(min(max(round(a["noise"] * 1.2), 3), 12))
+        if not dry_run:
+            bgr = enhance_denoise(bgr, strength=strength)
+        actions.append(f"reducir ruido (σ={a['noise']:.1f}, h={strength})")
+
+    if a["cast"] > AUTO_CAST:
+        bgr = _correct_cast(bgr, a["da"], a["db"])
+        actions.append(f"corregir dominante de color ({a['cast']:.0f})")
+
+    if a["range"] < AUTO_LOW_RANGE:
+        bgr = _stretch_levels(bgr, a["p_lo"], a["p_hi"])
+        actions.append(f"ampliar rango tonal ({a['range']:.0f} → ~255)")
+
+    mean = float(cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[:, :, 0].mean())
+    if mean < AUTO_DARK_MEAN:
+        bgr = _gamma_toward(bgr, mean)
+        actions.append(f"aclarar (brillo {mean:.0f})")
+    elif mean > AUTO_BRIGHT_MEAN:
+        bgr = _gamma_toward(bgr, mean)
+        actions.append(f"oscurecer (brillo {mean:.0f})")
+
+    if not upscaled and a["sharpness"] < AUTO_SOFT:
+        # Enfoque suave si hay ruido o baja resolución: evita realzar artefactos
+        amount = 0.3 if (a["noise"] > AUTO_NOISE_SIGMA or a["low_res"]) else 0.6
+        bgr = enhance_sharpen(bgr, amount=amount)
+        actions.append(f"enfocar ({amount}, nitidez {a['sharpness']:.0f})")
+
+    return bgr, a, actions
+
+
+def _auto_report_row(path: Path, a: dict, actions: list[str]) -> dict:
+    return {
+        "archivo": str(path),
+        "resolucion": f"{a['width']}x{a['height']}",
+        "baja_resolucion": "SI" if a["low_res"] else "",
+        "ruido_sigma": f"{a['noise']:.1f}",
+        "brillo_medio": f"{a['mean']:.0f}",
+        "rango_tonal": f"{a['range']:.0f}",
+        "dominante_color": f"{a['cast']:.1f}",
+        "nitidez": f"{a['sharpness']:.0f}",
+        "acciones": "; ".join(actions) if actions else "ninguna (ya está bien)",
+    }
 
 
 ENHANCE_FILTERS = {
-    "auto": enhance_auto,
     "clahe": enhance_clahe,
     "denoise": lambda img: enhance_denoise(img, strength=8),
     "gamma": enhance_gamma,
@@ -1334,6 +1507,9 @@ def run_enhance(source: Path, output: Path, mode: str):
             print("  ✗ No se pudo obtener el modelo. Abortando.")
             return
         sr = _make_superres(model_name, model_path)
+    elif mode in ("auto", "diagnose"):
+        esrgan = None
+        auto_esrgan = find_realesrgan()   # opcional: solo para baja resolución
     elif mode not in ENHANCE_FILTERS:
         print(f"  ✗ Modo desconocido: {mode}")
         return
@@ -1344,10 +1520,16 @@ def run_enhance(source: Path, output: Path, mode: str):
         return
 
     _prepare_output_dir(output)
-    print(f"  {len(images)} imágenes a procesar\n")
+    adaptive = mode in ("auto", "diagnose")
+    diagnose_only = mode == "diagnose"
+    verb = "a analizar" if diagnose_only else "a procesar"
+    print(f"  {len(images)} imágenes {verb}\n")
     upscaling = sr is not None or esrgan is not None
 
     ok, errors, metadata_warnings = 0, 0, 0
+    report_rows = []
+    action_counts = defaultdict(int)
+    lowres_without_esrgan = 0
     t0 = time.time()
 
     for i, img_path in enumerate(images, 1):
@@ -1367,7 +1549,25 @@ def run_enhance(source: Path, output: Path, mode: str):
 
         try:
             pil = _load_oriented_rgb(img_path)
-            if esrgan:
+            if adaptive:
+                arr = _pil_to_bgr(pil)
+                arr, analysis, actions = enhance_adaptive(
+                    arr, auto_esrgan, dry_run=diagnose_only)
+                if analysis["low_res"] and not auto_esrgan:
+                    lowres_without_esrgan += 1
+                for act in actions:
+                    action_counts[act.split(" (")[0]] += 1
+                report_rows.append(_auto_report_row(img_path, analysis, actions))
+                if diagnose_only:
+                    ok += 1
+                    continue
+                if not actions:
+                    # Nada que corregir: copia exacta, sin re-comprimir
+                    shutil.copy2(str(img_path), str(dst))
+                    ok += 1
+                    continue
+                result = _bgr_to_pil(arr)
+            elif esrgan:
                 result = realesrgan_upscale(pil, esrgan)
             else:
                 arr = _pil_to_bgr(pil)
@@ -1396,7 +1596,30 @@ def run_enhance(source: Path, output: Path, mode: str):
             print(f"    [{i}/{len(images)}] {i * 100 // len(images)}%", end="\r")
 
     elapsed = time.time() - t0
-    print(f"\n\n  ✓ {ok} mejoradas | {errors} errores | {elapsed:.1f}s")
+    done = "analizadas" if diagnose_only else "mejoradas"
+    print(f"\n\n  ✓ {ok} {done} | {errors} errores | {elapsed:.1f}s")
+
+    if adaptive and report_rows:
+        untouched = sum(1 for r in report_rows if r["acciones"].startswith("ninguna"))
+        print("\n  Diagnóstico:" if diagnose_only else "\n  Correcciones aplicadas:")
+        for name, count in sorted(action_counts.items(), key=lambda x: -x[1]):
+            print(f"    {count:5d}  {name}")
+        print(f"    {untouched:5d}  sin cambios (ya estaban bien)")
+        if lowres_without_esrgan:
+            print(f"\n  ⚠ {lowres_without_esrgan} foto(s) de baja resolución (<{AUTO_LOWRES_SIDE} px).")
+            print("    Los ajustes de tono no recuperan detalle que no existe.")
+            print("    Para mejorarlas de verdad instala Real-ESRGAN:")
+            print("    https://github.com/xinntao/Real-ESRGAN/releases")
+        report = output / "mejora_reporte.csv"
+        try:
+            with open(report, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(report_rows[0]))
+                writer.writeheader()
+                writer.writerows(report_rows)
+            print(f"\n  ✓ Reporte por foto: {report}")
+        except OSError as e:
+            print(f"  ⚠ No se pudo escribir el reporte: {e}")
+
     if metadata_warnings:
         print(f"  ⚠ {metadata_warnings} archivo(s) sin metadatos restaurados (EXIF/ICC/DPI)")
     print(f"  ✓ Resultado en: {output}")
@@ -1921,7 +2144,7 @@ def menu_enhance():
     es_tag = " (recomendado)" if esrgan else " (no instalado)"
     print(f"""
   Modos de mejora:
-    1. Ajuste automático (contraste + color + nitidez){cv_tag}
+    1. Automático inteligente (analiza cada foto y corrige solo lo necesario){cv_tag}
     2. Super-resolución ×2 Real-ESRGAN{es_tag}
     3. Super-resolución ×2 FSRCNN (ligera){sr_tag}
     4. Super-resolución ×2 ESPCN (ligera){sr_tag}
@@ -1929,6 +2152,7 @@ def menu_enhance():
     6. Corregir contraste (CLAHE){cv_tag}
     7. Corregir iluminación (gamma){cv_tag}
     8. Aumentar nitidez (sharpen){cv_tag}
+    9. Solo diagnosticar (no modifica nada, genera reporte){cv_tag}
 
   ℹ FSRCNN/ESPCN apenas superan a un reescalado bicúbico en fotos reales.
 """)
@@ -1936,7 +2160,7 @@ def menu_enhance():
     mode_map = {
         "1": "auto", "2": "realesrgan", "3": "superres_fsrcnn",
         "4": "superres_espcn", "5": "denoise", "6": "clahe",
-        "7": "gamma", "8": "sharpen",
+        "7": "gamma", "8": "sharpen", "9": "diagnose",
     }
     mode = mode_map.get(opt)
     if not mode:
