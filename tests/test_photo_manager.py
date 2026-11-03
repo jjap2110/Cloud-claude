@@ -313,7 +313,7 @@ def test_realesrgan_integration_with_fake_binary(tmp_path, monkeypatch):
     scene().save(src / "a.jpg", quality=95,
                  exif=exif_bytes(original="2019:05:05 12:00:00"))
 
-    pm.run_enhance(src, out, "realesrgan")
+    pm.run_enhance(src, out, "realesrgan", target="x2")
 
     with Image.open(out / "a_x2.jpg") as res:
         assert res.size == (640, 480)
@@ -433,9 +433,9 @@ def test_auto_upscales_low_res_with_esrgan(tmp_path):
     exe.write_text(FAKE_ESRGAN.format(python=sys.executable))
     exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
     small = photo(800, 600)
-    out, _, actions = pm.enhance_adaptive(small, esrgan=exe)
-    assert "super-resolución ×2" in kinds(actions)
-    assert out.shape[:2] == (1200, 1600)
+    out, _, actions = pm.enhance_adaptive(small, esrgan=exe, target="fullhd")
+    assert any(a.startswith("super-resolución") for a in actions)
+    assert out.shape[:2] == (1080, 1440)      # cabe en 1920×1080
 
 
 def test_diagnose_mode_writes_report_and_no_images(tmp_path):
@@ -500,3 +500,76 @@ def test_find_realesrgan_restores_exec_permission():
 
 def test_find_realesrgan_none_when_missing():
     assert pm.find_realesrgan() is None
+
+
+# ──────────────────────────────────────────────────────────────
+# Resolución final (Full HD / 2K / 4K / ×2 / ×4)
+# ──────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("w, h, target, size", [
+    (640, 480, "fullhd", (1440, 1080)),     # 4:3 cabe por altura
+    (960, 540, "fullhd", (1920, 1080)),     # 16:9 exacto
+    (480, 640, "fullhd", (1080, 1440)),     # vertical: recuadro girado 1080×1920
+    (1000, 750, "2k", (1920, 1440)),
+    (1000, 750, "4k", (2880, 2160)),
+    (800, 600, "x2", (1600, 1200)),
+    (800, 600, "x4", (3200, 2400)),
+])
+def test_upscale_factor_fits_target_box(w, h, target, size):
+    scale = pm.upscale_factor(w, h, target)
+    assert pm.target_size(w, h, scale) == size
+
+
+def _fake_esrgan_exe(tmp_path):
+    exe = tmp_path / "fake_esrgan"
+    exe.write_text(FAKE_ESRGAN.format(python=sys.executable))
+    exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
+    return exe
+
+
+def test_realesrgan_mode_resizes_to_target_and_names_file(tmp_path, monkeypatch):
+    monkeypatch.setenv(pm.REALESRGAN_ENV, str(_fake_esrgan_exe(tmp_path)))
+    src, out = tmp_path / "src", tmp_path / "out"
+    src.mkdir()
+    Image.fromarray(photo(640, 480)).save(src / "a.jpg", quality=95)
+    pm.run_enhance(src, out, "realesrgan", target="fullhd")
+    with Image.open(out / "a_FHD.jpg") as res:
+        assert res.size == (1440, 1080)
+
+
+def test_realesrgan_mode_caps_at_x4(tmp_path, monkeypatch):
+    monkeypatch.setenv(pm.REALESRGAN_ENV, str(_fake_esrgan_exe(tmp_path)))
+    src, out = tmp_path / "src", tmp_path / "out"
+    src.mkdir()
+    Image.fromarray(photo(320, 240)).save(src / "mini.jpg")   # 4K pediría ×9
+    pm.run_enhance(src, out, "realesrgan", target="4k")
+    with Image.open(out / "mini_4K.jpg") as res:
+        assert res.size == (1280, 960)
+
+
+def test_realesrgan_mode_copies_photos_already_at_target(tmp_path, monkeypatch):
+    monkeypatch.setenv(pm.REALESRGAN_ENV, str(_fake_esrgan_exe(tmp_path)))
+    src, out = tmp_path / "src", tmp_path / "out"
+    src.mkdir()
+    Image.fromarray(photo(2000, 1500)).save(src / "grande.jpg", quality=92)
+    pm.run_enhance(src, out, "realesrgan", target="fullhd")
+    assert (out / "grande.jpg").read_bytes() == (src / "grande.jpg").read_bytes()
+    assert not (out / "grande_FHD.jpg").exists()
+
+
+def test_auto_does_not_upscale_photo_already_at_target(tmp_path):
+    exe = _fake_esrgan_exe(tmp_path)
+    _, a, actions = pm.enhance_adaptive(photo(2000, 1500), esrgan=exe, target="fullhd")
+    assert not a["needs_upscale"]
+    assert not any(x.startswith("super-resolución") for x in actions)
+    # La misma foto sí necesita ampliarse para 4K
+    _, a, actions = pm.enhance_adaptive(photo(2000, 1500), esrgan=exe,
+                                        target="4k", dry_run=True)
+    assert any(x.startswith("super-resolución") for x in actions)
+
+
+def test_script_folder_has_priority_over_env(tmp_path, monkeypatch):
+    local = _fake_exe(pm.SCRIPT_DIR / "realesrgan" / "realesrgan-ncnn-vulkan")
+    other = _fake_exe(tmp_path / "otro" / "realesrgan-ncnn-vulkan")
+    monkeypatch.setenv(pm.REALESRGAN_ENV, str(other))
+    assert pm.find_realesrgan() == local

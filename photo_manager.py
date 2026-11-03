@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Photo Manager CLI v1.8.1
+Photo Manager CLI v1.9.0
 Herramienta completa de gestión de fotos.
 
 Funcionalidades:
@@ -93,7 +93,7 @@ if _CV2:
 # CONSTANTES
 # ══════════════════════════════════════════════════
 
-VERSION = "1.8.1"
+VERSION = "1.9.0"
 
 # [FIX #12] Separar formatos soportados por Pillow vs RAW
 PILLOW_EXTENSIONS = {
@@ -1249,42 +1249,83 @@ def _ensure_executable(path: Path) -> Path:
 
 
 def find_realesrgan() -> Path | None:
-    """Busca realesrgan-ncnn-vulkan, en este orden:
+    """Busca realesrgan-ncnn-vulkan. Ubicación principal: la carpeta
+    'realesrgan' junto a photo_manager.py (también un nivel más adentro,
+    por si el zip se descomprimió dentro de su propia subcarpeta).
 
-    1. Variable de entorno PHOTO_MANAGER_REALESRGAN
-    2. Carpeta 'realesrgan' junto a photo_manager.py
-    3. ~/.photo_manager/realesrgan
-    4. PATH del sistema
-    En 2 y 3 también mira un nivel más adentro, por si el zip se
-    descomprimió dentro de su propia subcarpeta.
+    Solo si ahí no está, usa como respaldo: variable de entorno
+    PHOTO_MANAGER_REALESRGAN → ~/.photo_manager/realesrgan → PATH.
     """
+    primary, *fallback_dirs = _realesrgan_search_dirs()
+    found = _find_in_dir(primary)
+    if found:
+        return found
     env = os.environ.get(REALESRGAN_ENV)
     if env:
         p = Path(env).expanduser()
-        return _ensure_executable(p) if p.is_file() else None
-    for base in _realesrgan_search_dirs():
-        if not base.is_dir():
-            continue
-        candidates = [base / n for n in _REALESRGAN_NAMES]
-        try:
-            candidates += sorted(c for sub in base.iterdir() if sub.is_dir()
-                                 for c in (sub / n for n in _REALESRGAN_NAMES))
-        except OSError:
-            pass
-        for p in candidates:
-            if p.is_file():
-                return _ensure_executable(p)
+        if p.is_file():
+            return _ensure_executable(p)
+    for base in fallback_dirs:
+        found = _find_in_dir(base)
+        if found:
+            return found
     found = shutil.which("realesrgan-ncnn-vulkan")
     return Path(found) if found else None
 
 
-def realesrgan_upscale(img: Image.Image, exe: Path, out_scale: int = 2,
-                       timeout: int = 900) -> Image.Image:
-    """Super-resolución con Real-ESRGAN (x4plus) y reducción LANCZOS a ×out_scale.
+def _find_in_dir(base: Path) -> Path | None:
+    """Ejecutable en base/ o en base/<subcarpeta>/."""
+    if not base.is_dir():
+        return None
+    candidates = [base / n for n in _REALESRGAN_NAMES]
+    try:
+        candidates += sorted(c for sub in base.iterdir() if sub.is_dir()
+                             for c in (sub / n for n in _REALESRGAN_NAMES))
+    except OSError:
+        pass
+    for p in candidates:
+        if p.is_file():
+            return _ensure_executable(p)
+    return None
 
-    El modelo x4plus solo trabaja a ×4; reducir a ×2 da mejor resultado que
-    un modelo ×2 débil y evita archivos 16 veces más grandes.
+
+# Resoluciones finales. Las de pantalla definen un recuadro (lado largo ×
+# lado corto) en el que la foto debe CABER, girado si la foto es vertical:
+# 640×480 → Full HD = 1440×1080 (no 1920×1440). Los factores son fijos.
+UPSCALE_TARGETS = {
+    "fullhd": {"label": "Full HD (1920×1080)", "box": (1920, 1080), "suffix": "_FHD"},
+    "2k":     {"label": "2K (2560×1440)",      "box": (2560, 1440), "suffix": "_2K"},
+    "4k":     {"label": "4K (3840×2160)",      "box": (3840, 2160), "suffix": "_4K"},
+    "x2":     {"label": "×2 (el doble)",       "factor": 2.0,       "suffix": "_x2"},
+    "x4":     {"label": "×4 (máximo)",         "factor": 4.0,       "suffix": "_x4"},
+}
+DEFAULT_TARGET = "fullhd"
+REALESRGAN_MAX_SCALE = 4.0   # el modelo x4plus no da más de ×4
+AUTO_MIN_UPSCALE = 1.25      # en modo auto, no vale la pena ampliar menos
+
+
+def upscale_factor(width: int, height: int, target: str) -> float:
+    """Factor necesario para llegar a la resolución `target` (sin límite)."""
+    spec = UPSCALE_TARGETS[target]
+    if "factor" in spec:
+        return spec["factor"]
+    box_long, box_short = spec["box"]
+    long_side, short_side = max(width, height), min(width, height)
+    return min(box_long / long_side, box_short / short_side)
+
+
+def target_size(width: int, height: int, scale: float) -> tuple[int, int]:
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
+def realesrgan_upscale(img: Image.Image, exe: Path, out_scale: float = 2,
+                       timeout: int = 1800) -> Image.Image:
+    """Super-resolución con Real-ESRGAN (x4plus) y ajuste LANCZOS a ×out_scale.
+
+    El modelo x4plus siempre amplía ×4; luego se reduce al tamaño pedido.
+    Reducir desde ×4 da mejor resultado que un modelo ×2 débil.
     """
+    out_scale = min(float(out_scale), REALESRGAN_MAX_SCALE)
     with tempfile.TemporaryDirectory(prefix="pm_esrgan_") as tmp:
         src = Path(tmp) / "in.png"
         dst = Path(tmp) / "out.png"
@@ -1307,7 +1348,7 @@ def realesrgan_upscale(img: Image.Image, exe: Path, out_scale: int = 2,
                                   f" (código {res.returncode}, sin salida)"))
         with Image.open(dst) as up:
             up = up.convert("RGB")
-            target = (img.width * out_scale, img.height * out_scale)
+            target = target_size(img.width, img.height, out_scale)
             if up.size != target:
                 up = up.resize(target, Image.Resampling.LANCZOS)
             return up
@@ -1430,24 +1471,34 @@ def _gamma_toward(bgr, mean: float, target: float = 118.0, amount: float = 0.6):
     return _lab_apply(bgr, fn)
 
 
-def enhance_adaptive(bgr, esrgan: Path | None = None, dry_run: bool = False):
+def enhance_adaptive(bgr, esrgan: Path | None = None, dry_run: bool = False,
+                     target: str = DEFAULT_TARGET):
     """Analiza la foto y aplica solo las correcciones que necesita.
 
     Retorna (imagen BGR, análisis, lista de acciones legibles).
     Orden: super-resolución → ruido → color → rango → exposición → nitidez.
     Con dry_run=True decide igual pero omite los pasos lentos (super-
     resolución y reducción de ruido); sirve para el modo diagnóstico.
+    `target` (clave de UPSCALE_TARGETS) fija la resolución final: solo se
+    amplía si la foto no la alcanza por al menos AUTO_MIN_UPSCALE.
     """
     a = analyze_image(bgr)
     actions = []
 
+    needed = upscale_factor(a["width"], a["height"], target)
+    a["upscale_needed"] = needed
+    a["needs_upscale"] = needed >= AUTO_MIN_UPSCALE
+
     upscaled = False
-    if a["low_res"] and esrgan:
+    if a["needs_upscale"] and esrgan:
         # Real-ESRGAN además limpia ruido y artefactos JPEG
+        scale = min(needed, REALESRGAN_MAX_SCALE)
+        new_w, new_h = target_size(a["width"], a["height"], scale)
         if not dry_run:
-            bgr = _pil_to_bgr(realesrgan_upscale(_bgr_to_pil(bgr), esrgan))
-        actions.append(f"super-resolución ×2 ({a['width']}x{a['height']} → "
-                       f"{a['width'] * 2}x{a['height'] * 2})")
+            bgr = _pil_to_bgr(realesrgan_upscale(_bgr_to_pil(bgr), esrgan, scale))
+        capped = " (limitado a ×4)" if needed > REALESRGAN_MAX_SCALE else ""
+        actions.append(f"super-resolución ×{scale:.2g} ({a['width']}x{a['height']} → "
+                       f"{new_w}x{new_h}){capped}")
         upscaled = True
 
     if not upscaled and a["noise"] > AUTO_NOISE_SIGMA:
@@ -1486,6 +1537,8 @@ def _auto_report_row(path: Path, a: dict, actions: list[str]) -> dict:
         "archivo": str(path),
         "resolucion": f"{a['width']}x{a['height']}",
         "baja_resolucion": "SI" if a["low_res"] else "",
+        "ampliacion_necesaria": (f"×{a['upscale_needed']:.2f}"
+                                 if a.get("needs_upscale") else ""),
         "ruido_sigma": f"{a['noise']:.1f}",
         "brillo_medio": f"{a['mean']:.0f}",
         "rango_tonal": f"{a['range']:.0f}",
@@ -1503,13 +1556,19 @@ ENHANCE_FILTERS = {
 }
 
 
-def run_enhance(source: Path, output: Path, mode: str):
+def run_enhance(source: Path, output: Path, mode: str,
+                target: str = DEFAULT_TARGET):
     """Ejecuta mejora de fotos.
 
-    Modos: auto, clahe, denoise, gamma, sharpen (OpenCV);
-    superres_fsrcnn, superres_espcn (OpenCV dnn_superres);
+    Modos: auto, diagnose, clahe, denoise, gamma, sharpen (OpenCV);
+    superres_fsrcnn, superres_espcn (OpenCV dnn_superres, ×2 fijo);
     realesrgan (binario externo realesrgan-ncnn-vulkan).
+    `target` (clave de UPSCALE_TARGETS): resolución final para Real-ESRGAN,
+    tanto en el modo realesrgan como en auto.
     """
+    if target not in UPSCALE_TARGETS:
+        print(f"  ✗ Resolución desconocida: {target}")
+        return
     if mode != "realesrgan" and not _ensure_cv2():
         return
     if not _NUMPY:
@@ -1557,12 +1616,15 @@ def run_enhance(source: Path, output: Path, mode: str):
     diagnose_only = mode == "diagnose"
     verb = "a analizar" if diagnose_only else "a procesar"
     print(f"  {len(images)} imágenes {verb}\n")
-    upscaling = sr is not None or esrgan is not None
+    if esrgan or (adaptive and auto_esrgan):
+        print(f"  Resolución final: {UPSCALE_TARGETS[target]['label']}\n")
+    suffix = "_x2" if sr is not None else UPSCALE_TARGETS[target]["suffix"]
 
     ok, errors, metadata_warnings = 0, 0, 0
     report_rows = []
     action_counts = defaultdict(int)
     lowres_without_esrgan = 0
+    already_big = 0
     t0 = time.time()
 
     for i, img_path in enumerate(images, 1):
@@ -1570,9 +1632,10 @@ def run_enhance(source: Path, output: Path, mode: str):
             rel = img_path.relative_to(source)
         except ValueError:
             rel = Path(img_path.name)
-        dst = output / rel
-        if upscaling:
-            dst = dst.with_stem(dst.stem + "_x2")
+        plain_dst = output / rel
+        dst = plain_dst
+        if sr is not None or esrgan is not None:
+            dst = dst.with_stem(dst.stem + suffix)
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst = _unique_path(dst)
         if dst.resolve() == img_path.resolve():
@@ -1585,11 +1648,11 @@ def run_enhance(source: Path, output: Path, mode: str):
             if adaptive:
                 arr = _pil_to_bgr(pil)
                 arr, analysis, actions = enhance_adaptive(
-                    arr, auto_esrgan, dry_run=diagnose_only)
-                if analysis["low_res"] and not auto_esrgan:
+                    arr, auto_esrgan, dry_run=diagnose_only, target=target)
+                if analysis["needs_upscale"] and not auto_esrgan:
                     lowres_without_esrgan += 1
                 for act in actions:
-                    action_counts[act.split(" (")[0]] += 1
+                    action_counts[act.split(" (")[0].split(" ×")[0]] += 1
                 report_rows.append(_auto_report_row(img_path, analysis, actions))
                 if diagnose_only:
                     ok += 1
@@ -1601,7 +1664,14 @@ def run_enhance(source: Path, output: Path, mode: str):
                     continue
                 result = _bgr_to_pil(arr)
             elif esrgan:
-                result = realesrgan_upscale(pil, esrgan)
+                scale = upscale_factor(pil.width, pil.height, target)
+                if scale <= 1.0:
+                    # Ya alcanza la resolución pedida: copia exacta, sin ampliar
+                    shutil.copy2(str(img_path), str(_unique_path(plain_dst)))
+                    already_big += 1
+                    ok += 1
+                    continue
+                result = realesrgan_upscale(pil, esrgan, scale)
             else:
                 arr = _pil_to_bgr(pil)
                 if sr is not None:
@@ -1631,6 +1701,9 @@ def run_enhance(source: Path, output: Path, mode: str):
     elapsed = time.time() - t0
     done = "analizadas" if diagnose_only else "mejoradas"
     print(f"\n\n  ✓ {ok} {done} | {errors} errores | {elapsed:.1f}s")
+    if already_big:
+        print(f"  ℹ {already_big} foto(s) ya tenían {UPSCALE_TARGETS[target]['label']} "
+              "o más: copiadas sin cambios")
 
     if adaptive and report_rows:
         untouched = sum(1 for r in report_rows if r["acciones"].startswith("ninguna"))
@@ -1639,7 +1712,8 @@ def run_enhance(source: Path, output: Path, mode: str):
             print(f"    {count:5d}  {name}")
         print(f"    {untouched:5d}  sin cambios (ya estaban bien)")
         if lowres_without_esrgan:
-            print(f"\n  ⚠ {lowres_without_esrgan} foto(s) de baja resolución (<{AUTO_LOWRES_SIDE} px).")
+            print(f"\n  ⚠ {lowres_without_esrgan} foto(s) por debajo de "
+                  f"{UPSCALE_TARGETS[target]['label']}.")
             print("    Los ajustes de tono no recuperan detalle que no existe.")
             print("    Para mejorarlas de verdad instala Real-ESRGAN:")
             print("    https://github.com/xinntao/Real-ESRGAN/releases")
@@ -2178,7 +2252,7 @@ def menu_enhance():
     print(f"""
   Modos de mejora:
     1. Automático inteligente (analiza cada foto y corrige solo lo necesario){cv_tag}
-    2. Super-resolución ×2 Real-ESRGAN{es_tag}
+    2. Super-resolución Real-ESRGAN: elegir Full HD / 2K / 4K{es_tag}
     3. Super-resolución ×2 FSRCNN (ligera){sr_tag}
     4. Super-resolución ×2 ESPCN (ligera){sr_tag}
     5. Reducir ruido{cv_tag}
@@ -2212,7 +2286,33 @@ def menu_enhance():
         print("  ✗ Este modo requiere OpenCV.")
         return
 
-    run_enhance(source, output, mode)
+    target = DEFAULT_TARGET
+    if mode == "realesrgan":
+        target = ask_target(include_factors=True)
+    elif mode in ("auto", "diagnose") and esrgan:
+        print("  Las fotos que no lleguen a esta resolución se ampliarán con Real-ESRGAN;")
+        print("  las que ya la tienen no se amplían.")
+        target = ask_target(include_factors=False)
+    if not target:
+        return
+
+    run_enhance(source, output, mode, target=target)
+
+
+def ask_target(include_factors: bool) -> str | None:
+    """Pregunta la resolución final de las fotos ampliadas."""
+    keys = [k for k, v in UPSCALE_TARGETS.items()
+            if include_factors or "box" in v]
+    print("\n  Resolución final:")
+    for n, key in enumerate(keys, 1):
+        print(f"    {n}. {UPSCALE_TARGETS[key]['label']}")
+    default = str(keys.index(DEFAULT_TARGET) + 1)
+    opt = ask("Resolución", default)
+    try:
+        return keys[int(opt) - 1]
+    except (ValueError, IndexError):
+        print("  Opción no válida.")
+        return None
 
 
 def menu_organize():
