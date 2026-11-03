@@ -688,3 +688,83 @@ def test_realesrgan_falls_back_to_one_by_one(tmp_path):
     exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
     ups = pm.realesrgan_batch([Image.fromarray(photo(64, 48))] * 3, exe, [2, 2, 2])
     assert [u.size for u in ups] == [(128, 96)] * 3
+
+
+# ──────────────────────────────────────────────────────────────
+# HDR de una sola foto (fusión de exposiciones)
+# ──────────────────────────────────────────────────────────────
+
+def window_scene(w=1600, h=1200, seed=0):
+    """Interior en sombra (izquierda) junto a una ventana luminosa (derecha)."""
+    import cv2
+    rng = np.random.default_rng(seed)
+    tex = cv2.resize(rng.integers(0, 255, (h // 20, w // 20), dtype=np.uint8), (w, h),
+                     interpolation=cv2.INTER_NEAREST).astype(np.float32) / 255
+    lum = np.empty((h, w), np.float32)
+    lum[:, :w // 2] = 0.08 + 0.20 * tex[:, :w // 2]
+    lum[:, w // 2:] = 0.70 + 0.25 * tex[:, w // 2:]
+    return (np.clip(np.dstack([lum * 0.95, lum, lum * 1.05]), 0, 1) * 255).astype(np.uint8)
+
+
+def _lum(bgr):
+    import cv2
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[:, :, 0].astype(float)
+
+
+@pytest.mark.parametrize("guided", [True, False])
+def test_hdr_lifts_shadows_without_burning_highlights(guided, monkeypatch):
+    monkeypatch.setattr(pm, "_HAS_GUIDED", guided and pm._HAS_GUIDED)
+    img = window_scene()
+    out = pm.enhance_hdr(img)
+    before, after = _lum(img), _lum(out)
+    half = img.shape[1] // 2
+    assert after[:, :half - 100].mean() > before[:, :half - 100].mean() + 15   # sombras
+    assert (after[:, half + 100:] >= 250).mean() <= (before[:, half + 100:] >= 250).mean()
+    assert after[:, half + 100:].std() >= before[:, half + 100:].std() * 0.9    # detalle luces
+
+
+def test_hdr_keeps_colors():
+    import cv2
+    img = np.clip(window_scene().astype(int) + [0, 0, 40], 0, 255).astype(np.uint8)
+    before = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)[:, :, 1:].astype(float)
+    after = cv2.cvtColor(pm.enhance_hdr(img), cv2.COLOR_BGR2LAB)[:, :, 1:].astype(float)
+    assert np.abs(after.mean(axis=(0, 1)) - before.mean(axis=(0, 1))).max() < 3
+
+
+def test_auto_applies_hdr_to_slightly_dark_photo():
+    """v1.10 solo aclaraba con brillo < 90: una foto 'un poco oscura' no se tocaba."""
+    # Tonos medios oscurecidos con rango completo (gamma 2): brillo medio ~97
+    img = ((photo() / 255.0) ** 2.0 * 255).astype(np.uint8)
+    assert 90 < _lum(img).mean() < 110
+    out, a, actions = pm.enhance_adaptive(img)
+    assert any(x.startswith("HDR") for x in actions)
+    assert _lum(out).mean() > _lum(img).mean() + 8
+
+
+def test_auto_applies_hdr_to_window_scene():
+    _, _, actions = pm.enhance_adaptive(window_scene())
+    assert any(x.startswith("HDR") for x in actions)
+
+
+def test_auto_no_hdr_on_well_exposed_photo():
+    _, _, actions = pm.enhance_adaptive(photo())
+    assert not any(x.startswith("HDR") for x in actions)
+
+
+def test_hdr_mode_writes_files(tmp_path):
+    src, out = tmp_path / "src", tmp_path / "out"
+    src.mkdir()
+    Image.fromarray(window_scene(800, 600)[:, :, ::-1]).save(src / "v.jpg", quality=95)
+    pm.run_enhance(src, out, "hdr")
+    with Image.open(out / "v.jpg") as res, Image.open(src / "v.jpg") as orig:
+        after = np.asarray(res.convert("L"))[:, :300].mean()      # zona en sombra
+        before = np.asarray(orig.convert("L"))[:, :300].mean()
+    assert after > before + 15
+
+
+def test_hdr_levels_are_ordered():
+    img = window_scene()
+    half = img.shape[1] // 2
+    lifts = [_lum(pm.enhance_hdr(img, lvl))[:, :half - 100].mean() for lvl in ("suave", "normal", "fuerte")]
+    assert lifts[0] < lifts[1] < lifts[2]
+    assert lifts[0] > _lum(img)[:, :half - 100].mean() + 10

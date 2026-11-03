@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Photo Manager CLI v1.10.0
+Photo Manager CLI v1.11.0
 Herramienta completa de gestión de fotos.
 
 Funcionalidades:
@@ -93,7 +93,7 @@ if _CV2:
 # CONSTANTES
 # ══════════════════════════════════════════════════
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 
 # [FIX #12] Separar formatos soportados por Pillow vs RAW
 PILLOW_EXTENSIONS = {
@@ -1633,13 +1633,25 @@ def _esrgan_chunks(items: list, sizes: list[tuple[int, int]]):
 # Si el diagnóstico (mejora_reporte.csv) no coincide con tu criterio, ajústalos.
 AUTO_LOWRES_SIDE = 1600   # lado mayor (px) por debajo → baja resolución
 AUTO_NOISE_SIGMA = 4.0    # ruido estimado (σ en escala 0-255)
-AUTO_DARK_MEAN = 90       # luminancia media por debajo → subexpuesta
 AUTO_BRIGHT_MEAN = 185    # luminancia media por encima → sobreexpuesta
 AUTO_LOW_RANGE = 170      # rango tonal p0.5–p99.5 por debajo → plana/lavada
 AUTO_CAST = 5.0           # tinte medio de los píxeles neutros (a/b en LAB)
 AUTO_NEUTRAL_CHROMA = 22  # croma máx. para considerar un píxel "casi neutro"
 AUTO_NEUTRAL_MIN_SHARE = 0.05  # mínimo de neutros (5 %) para poder juzgar
 AUTO_SOFT = 100.0         # varianza del Laplaciano a 1000 px → poco nítida
+AUTO_HDR_MEAN = 110       # brillo medio por debajo → HDR (levantar sombras)
+AUTO_HDR_SHADOWS = 0.30   # …o si más del 30 % de la foto está en sombra
+HDR_SHADOW_LEVEL = 70     # luminancia (0-255) por debajo de la cual es "sombra"
+# Intensidad del HDR: (exponente de la exposición clara, fuerza de la mezcla).
+# Medido en una foto oscura (brillo 97) y en un interior junto a una ventana
+# (sombras 47): suave → 104 / 66, normal → 109 / 80, fuerte → 115 / 94.
+HDR_LEVELS = {
+    "suave":  (0.55, 0.7),
+    "normal": (0.45, 0.9),
+    "fuerte": (0.40, 1.0),
+}
+DEFAULT_HDR = "normal"
+HDR_WEIGHT_MAX_PX = 2_000_000   # resolución máx. para calcular los pesos
 
 
 def estimate_noise(gray) -> float:
@@ -1736,6 +1748,134 @@ def _stretch_levels(bgr, p_lo: float, p_hi: float, max_gain: float = 1.6):
     return _lab_apply(bgr, fn)
 
 
+def _pyr_levels(h: int, w: int) -> int:
+    return int(min(max(math.log2(max(min(h, w), 1)) - 3, 3), 8))
+
+
+def _gauss_pyr(img, levels: int) -> list:
+    pyr = [img]
+    for _ in range(levels - 1):
+        pyr.append(cv2.pyrDown(pyr[-1]))
+    return pyr
+
+
+def _lap_pyr(img, levels: int) -> list:
+    g = _gauss_pyr(img, levels)
+    lap = [g[i] - cv2.pyrUp(g[i + 1], dstsize=(g[i].shape[1], g[i].shape[0]))
+           for i in range(levels - 1)]
+    lap.append(g[-1])
+    return lap
+
+
+def _hdr_exposures(lum, bright: float = 0.45):
+    """Exposiciones sintéticas de la luminancia (0-1): más oscura (protege
+    luces), original, más clara (abre sombras) y con contraste local."""
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    local = clahe.apply((lum * 255).astype(np.uint8)).astype(np.float32) / 255
+    yield np.power(lum, 1.5)
+    yield lum
+    yield np.power(lum, bright)
+    yield local
+
+
+def _hdr_weight(exp):
+    """Peso de Mertens: bien expuesto (cerca de 0,5) × contraste local.
+
+    El contraste se mide tras un leve desenfoque para que el ruido de las
+    sombras no cuente como 'detalle'.
+    """
+    well_exposed = np.exp(-((exp - 0.5) ** 2) / (2 * 0.2 ** 2))
+    contrast = np.abs(cv2.Laplacian(cv2.GaussianBlur(exp, (0, 0), 1.0), cv2.CV_32F))
+    return well_exposed * (contrast + 0.02) + 1e-6
+
+
+def _well_exposed(x):
+    return np.exp(-((x - 0.5) ** 2) / (2 * 0.2 ** 2)) + 1e-6
+
+
+def _hdr_fuse_guided(lum, bright: float):
+    """Fusión con pesos suavizados por filtro guiado (Li et al. 2013).
+
+    El filtro respeta los bordes de la propia foto: una zona en sombra junto
+    a una ventana no hereda el peso de la ventana, así que no aparece el
+    halo oscuro de la mezcla por pirámides (medido: −10 → ~0).
+    El peso se evalúa sobre la base suavizada (escala grande) y se aplica a
+    la exposición completa, que conserva el detalle fino.
+    """
+    gf = cv2.ximgproc.guidedFilter
+    h, w = lum.shape
+    # Los pesos son mapas suaves: se calculan sobre una copia de ≤2 MP y se
+    # amplían. Reduce memoria y tiempo ~4× en fotos grandes sin efecto visible.
+    f = min(1.0, math.sqrt(HDR_WEIGHT_MAX_PX / (h * w)))
+    small = (cv2.resize(lum, (max(1, round(w * f)), max(1, round(h * f))),
+                        interpolation=cv2.INTER_AREA) if f < 1 else lum)
+    r = max(4, min(small.shape) // 48)
+    eps = 1e-3
+    base = gf(small, small, r, eps)
+    num = np.zeros_like(lum)
+    den = np.zeros_like(lum)
+    for exp, exp_base in zip(_hdr_exposures(lum, bright), _hdr_exposures(base, bright)):
+        wmap = np.maximum(gf(small, _well_exposed(exp_base), r, eps), 1e-6)
+        if f < 1:
+            wmap = cv2.resize(wmap, (w, h), interpolation=cv2.INTER_LINEAR)
+        num += wmap * exp
+        den += wmap
+    return num / den
+
+
+def _hdr_fuse_pyramid(lum, bright: float):
+    """Respaldo sin ximgproc: fusión de Mertens por pirámides de Laplace
+    (puede dejar un halo oscuro leve junto a bordes muy contrastados)."""
+    h, w = lum.shape
+    levels = _pyr_levels(h, w)
+    weight_sum = sum(_hdr_weight(e) for e in _hdr_exposures(lum, bright))
+    fused = None
+    for exp in _hdr_exposures(lum, bright):
+        wpyr = _gauss_pyr(_hdr_weight(exp) / weight_sum, levels)
+        lpyr = _lap_pyr(exp, levels)
+        contrib = [wl * ll for wl, ll in zip(wpyr, lpyr)]
+        fused = contrib if fused is None else [f + c for f, c in zip(fused, contrib)]
+    del weight_sum
+    out = fused[-1]
+    for lvl in reversed(fused[:-1]):
+        out = cv2.pyrUp(out, dstsize=(lvl.shape[1], lvl.shape[0])) + lvl
+    return out
+
+
+_HAS_GUIDED = _CV2 and hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "guidedFilter")
+
+
+def enhance_hdr(bgr, level: str = DEFAULT_HDR):
+    """HDR de una sola foto: fusión de exposiciones sintéticas.
+
+    Genera versiones más oscura, original, más clara y con contraste local
+    de la luminancia, y las mezcla zona a zona tomando la mejor expuesta.
+    No inventa información (un JPEG no tiene la de varias exposiciones
+    reales, como el iPhone), pero aclara sombras sin quemar las luces.
+    Solo actúa sobre la luminancia: los colores se conservan.
+    """
+    bright, strength = HDR_LEVELS[level]
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lum = lab[:, :, 0] / 255.0
+    fused = (_hdr_fuse_guided(lum, bright) if _HAS_GUIDED
+             else _hdr_fuse_pyramid(lum, bright))
+    fused = np.clip(fused, 0.0, 1.0)
+    lab[:, :, 0] = np.clip((lum + strength * (fused - lum)) * 255, 0, 255)
+    return cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
+def _shadow_share(bgr) -> float:
+    """Fracción de la foto en sombra (medida sobre una copia reducida)."""
+    h, w = bgr.shape[:2]
+    small = bgr
+    if max(h, w) > BLUR_MAX_SIDE:
+        f = BLUR_MAX_SIDE / max(h, w)
+        small = cv2.resize(bgr, (max(1, round(w * f)), max(1, round(h * f))),
+                           interpolation=cv2.INTER_AREA)
+    lum = cv2.cvtColor(small, cv2.COLOR_BGR2LAB)[:, :, 0]
+    return float((lum < HDR_SHADOW_LEVEL).mean())
+
+
 def _gamma_toward(bgr, mean: float, target: float = 118.0, amount: float = 0.6):
     """Gamma en L que acerca la media a `target`, solo parcialmente."""
     mean = min(max(mean, 1.0), 254.0)
@@ -1752,7 +1892,7 @@ def _gamma_toward(bgr, mean: float, target: float = 118.0, amount: float = 0.6):
 
 def enhance_adaptive(bgr, esrgan: Path | None = None, dry_run: bool = False,
                      target: str = DEFAULT_TARGET, analysis: dict | None = None,
-                     upscaled=None):
+                     upscaled=None, hdr: str = DEFAULT_HDR):
     """Analiza la foto y aplica solo las correcciones que necesita.
 
     Retorna (imagen BGR, análisis, lista de acciones legibles).
@@ -1801,9 +1941,14 @@ def enhance_adaptive(bgr, esrgan: Path | None = None, dry_run: bool = False,
         actions.append(f"ampliar rango tonal ({a['range']:.0f} → ~255)")
 
     mean = float(cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[:, :, 0].mean())
-    if mean < AUTO_DARK_MEAN:
-        bgr = _gamma_toward(bgr, mean)
-        actions.append(f"aclarar (brillo {mean:.0f})")
+    shadows = _shadow_share(bgr)
+    a["shadows"] = shadows
+    if mean < AUTO_HDR_MEAN or shadows > AUTO_HDR_SHADOWS:
+        # HDR en vez de un aclarado global: abre sombras sin quemar luces
+        if not dry_run:
+            bgr = enhance_hdr(bgr, hdr)
+        actions.append(f"HDR {hdr}: aclarar sombras (brillo {mean:.0f}, "
+                       f"sombras {shadows * 100:.0f} %)")
     elif mean > AUTO_BRIGHT_MEAN:
         bgr = _gamma_toward(bgr, mean)
         actions.append(f"oscurecer (brillo {mean:.0f})")
@@ -1826,6 +1971,7 @@ def _auto_report_row(path: Path, a: dict, actions: list[str]) -> dict:
                                  if a.get("needs_upscale") else ""),
         "ruido_sigma": f"{a['noise']:.1f}",
         "brillo_medio": f"{a['mean']:.0f}",
+        "sombras_pct": f"{a['shadows'] * 100:.0f}" if "shadows" in a else "",
         "rango_tonal": f"{a['range']:.0f}",
         "dominante_color": f"{a['cast']:.1f}",
         "nitidez": f"{a['sharpness']:.0f}",
@@ -1838,6 +1984,7 @@ ENHANCE_FILTERS = {
     "denoise": lambda img: enhance_denoise(img, strength=8),
     "gamma": enhance_gamma,
     "sharpen": lambda img: enhance_sharpen(img, amount=0.6),
+    "hdr": enhance_hdr,
 }
 
 
@@ -1872,7 +2019,7 @@ def _enhance_task(job: dict) -> dict:
                 return res
             arr, analysis, actions = enhance_adaptive(
                 arr, job["esrgan"], dry_run=(mode == "diagnose"),
-                target=job["target"], analysis=analysis)
+                target=job["target"], analysis=analysis, hdr=job["hdr"])
             res.update(analysis=analysis, actions=actions,
                        row=_auto_report_row(src, analysis, actions))
             if mode == "diagnose":
@@ -1882,6 +2029,8 @@ def _enhance_task(job: dict) -> dict:
                 shutil.copy2(str(src), str(dst))
                 res["status"] = "copied"
                 return res
+        elif mode == "hdr":
+            arr = enhance_hdr(arr, job["hdr"])
         else:
             arr = ENHANCE_FILTERS[mode](arr)
         written, meta_ok = _save_pil(_bgr_to_pil(arr), dst, src)
@@ -1894,7 +2043,8 @@ def _enhance_task(job: dict) -> dict:
 
 
 def run_enhance(source: Path, output: Path, mode: str,
-                target: str = DEFAULT_TARGET, workers: int | None = None):
+                target: str = DEFAULT_TARGET, workers: int | None = None,
+                hdr: str = DEFAULT_HDR):
     """Ejecuta mejora de fotos.
 
     Modos: auto, diagnose, clahe, denoise, gamma, sharpen (OpenCV);
@@ -1972,7 +2122,7 @@ def run_enhance(source: Path, output: Path, mode: str,
         dst = plain.with_stem(plain.stem + suffix) if upscale_mode else plain
         dst.parent.mkdir(parents=True, exist_ok=True)
         jobs.append({"src": img_path, "dst": _unique_path(dst), "plain": plain,
-                     "mode": mode, "target": target, "esrgan": esrgan})
+                     "mode": mode, "target": target, "esrgan": esrgan, "hdr": hdr})
 
     ok = errors = metadata_warnings = already_big = lowres_without_esrgan = 0
     report_rows, error_msgs = [], []
@@ -2082,7 +2232,7 @@ def run_enhance(source: Path, output: Path, mode: str,
                     if analysis is not None:          # modo auto: resto de ajustes
                         arr, analysis, actions = enhance_adaptive(
                             _pil_to_bgr(img), esrgan, target=target,
-                            analysis=analysis, upscaled=_pil_to_bgr(up))
+                            analysis=analysis, upscaled=_pil_to_bgr(up), hdr=hdr)
                         up = _bgr_to_pil(arr)
                         res.update(analysis=analysis, actions=actions,
                                    row=_auto_report_row(job["src"], analysis, actions))
@@ -2114,6 +2264,7 @@ def run_enhance(source: Path, output: Path, mode: str,
         untouched = sum(1 for r in report_rows if r["acciones"].startswith("ninguna"))
         print("\n  Diagnóstico:" if diagnose_only else "\n  Correcciones aplicadas:")
         for name, count in sorted(action_counts.items(), key=lambda x: -x[1]):
+            name = name.split(":")[0]
             print(f"    {count:5d}  {name}")
         print(f"    {untouched:5d}  sin cambios (ya estaban bien)")
         if lowres_without_esrgan:
@@ -2660,7 +2811,8 @@ def menu_enhance():
     es_tag = " (recomendado)" if esrgan else " (no instalado)"
     print(f"""
   Modos de mejora:
-    1. Automático inteligente (analiza cada foto y corrige solo lo necesario){cv_tag}
+    1. Automático inteligente (analiza cada foto y corrige solo lo necesario,
+       incluye HDR en fotos oscuras){cv_tag}
     2. Super-resolución Real-ESRGAN: elegir Full HD / 2K / 4K{es_tag}
     3. Super-resolución ×2 FSRCNN (ligera){sr_tag}
     4. Super-resolución ×2 ESPCN (ligera){sr_tag}
@@ -2669,6 +2821,7 @@ def menu_enhance():
     7. Corregir iluminación (gamma){cv_tag}
     8. Aumentar nitidez (sharpen){cv_tag}
     9. Solo diagnosticar (no modifica nada, genera reporte){cv_tag}
+   10. HDR: aclarar sombras sin quemar luces (a todas){cv_tag}
 
   ℹ FSRCNN/ESPCN apenas superan a un reescalado bicúbico en fotos reales.
 """)
@@ -2676,7 +2829,7 @@ def menu_enhance():
     mode_map = {
         "1": "auto", "2": "realesrgan", "3": "superres_fsrcnn",
         "4": "superres_espcn", "5": "denoise", "6": "clahe",
-        "7": "gamma", "8": "sharpen", "9": "diagnose",
+        "7": "gamma", "8": "sharpen", "9": "diagnose", "10": "hdr",
     }
     mode = mode_map.get(opt)
     if not mode:
@@ -2705,7 +2858,28 @@ def menu_enhance():
     if not target:
         return
 
-    run_enhance(source, output, mode, target=target)
+    hdr = DEFAULT_HDR
+    if mode in ("auto", "diagnose", "hdr"):
+        hdr = ask_hdr_level()
+        if not hdr:
+            return
+
+    run_enhance(source, output, mode, target=target, hdr=hdr)
+
+
+def ask_hdr_level() -> str | None:
+    """Pregunta cuánto aclarar las sombras (HDR)."""
+    keys = list(HDR_LEVELS)
+    print("\n  Intensidad del HDR (cuánto aclarar las fotos oscuras):")
+    labels = {"suave": "Suave", "normal": "Normal (recomendado)", "fuerte": "Fuerte (aspecto HDR marcado)"}
+    for n, key in enumerate(keys, 1):
+        print(f"    {n}. {labels.get(key, key)}")
+    opt = ask("Intensidad", str(keys.index(DEFAULT_HDR) + 1))
+    try:
+        return keys[int(opt) - 1]
+    except (ValueError, IndexError):
+        print("  Opción no válida.")
+        return None
 
 
 def ask_target(include_factors: bool) -> str | None:
