@@ -324,3 +324,28 @@ def test_realesrgan_failure_is_reported_not_silent(tmp_path, monkeypatch):
     img = scene()
     with pytest.raises(RuntimeError):
         pm.realesrgan_upscale(img, exe)
+
+
+# ──────────────────────────────────────────────────────────────
+# Rutas pegadas / arrastradas a la terminal
+# ──────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("raw, expected", [
+    ("'/media/inst/Docs_Josmar/fotos/Alemania'", "/media/inst/Docs_Josmar/fotos/Alemania"),
+    ("'/media/inst/fotos/Alemania'   ", "/media/inst/fotos/Alemania"),
+    ('"/home/u/Mis Fotos"', "/home/u/Mis Fotos"),
+    ("/home/u/Mis\\ Fotos", "/home/u/Mis Fotos"),
+    ("file:///home/u/Mis%20Fotos", "/home/u/Mis Fotos"),
+    ("& 'C:\\Users\\u\\Fotos'", "C:\\Users\\u\\Fotos"),
+    ("/home/u/fotos", "/home/u/fotos"),
+    ("", ""),
+])
+def test_clean_path_input(raw, expected):
+    assert pm.clean_path_input(raw) == expected
+
+
+def test_ask_folder_accepts_quoted_dragged_path(tmp_path, monkeypatch):
+    d = tmp_path / "Mis Fotos"
+    d.mkdir()
+    monkeypatch.setattr("builtins.input", lambda _: f"'{d}' ")
+    assert pm.ask_folder("Carpeta") == d.resolve()

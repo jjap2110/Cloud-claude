@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Photo Manager CLI v1.7.0
+Photo Manager CLI v1.7.1
 Herramienta completa de gestión de fotos.
 
 Funcionalidades:
@@ -91,7 +91,7 @@ if _CV2:
 # CONSTANTES
 # ══════════════════════════════════════════════════
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 
 # [FIX #12] Separar formatos soportados por Pillow vs RAW
 PILLOW_EXTENSIONS = {
@@ -176,8 +176,28 @@ def ask(prompt: str, default: str = "") -> str:
     return val or default
 
 
+def clean_path_input(raw: str) -> str:
+    """Normaliza una ruta pegada o arrastrada a la terminal.
+
+    Quita comillas envolventes ('...' o "..."), el prefijo file:// y los
+    escapes con barra invertida ('Mis\\ Fotos') que añaden los gestores de
+    archivos y terminales de Linux/macOS al arrastrar una carpeta.
+    """
+    s = raw.strip()
+    if s.startswith("& "):           # PowerShell al arrastrar: & 'C:\\ruta'
+        s = s[2:].strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1]
+    elif os.name != "nt" and "\\" in s:
+        s = re.sub(r"\\(.)", r"\1", s)
+    if s.startswith("file://"):
+        from urllib.parse import unquote, urlparse
+        s = unquote(urlparse(s).path)
+    return s
+
+
 def ask_folder(prompt: str, must_exist: bool = True) -> Path | None:
-    raw = ask(prompt)
+    raw = clean_path_input(ask(prompt))
     if not raw:
         return None
     p = Path(raw).expanduser().resolve()
