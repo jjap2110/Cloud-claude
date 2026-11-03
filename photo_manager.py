@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """
-Photo Manager CLI v1.6.4
+Photo Manager CLI v1.7.0
 Herramienta completa de gestión de fotos.
 
 Funcionalidades:
-  1. Deduplicar fotos (pHash + BK-tree + complete-link clustering)
+  1. Deduplicar fotos (pHash + BK-tree + complete-link, caché SQLite)
   2. Comparar dos carpetas en busca de duplicados cruzados
-  3. Mejorar fotos con IA (FSRCNN/ESPCN super-resolución) + OpenCV
-  4. Organizar por fecha (Año/Mes desde EXIF)
-  5. Detectar fotos borrosas (Laplacian variance)
+  3. Mejorar fotos: ajustes OpenCV, super-resolución FSRCNN/ESPCN y
+     Real-ESRGAN (opcional, binario externo realesrgan-ncnn-vulkan)
+  4. Organizar por fecha (Año/Mes: EXIF captura → nombre de archivo → mtime)
+  5. Detectar fotos borrosas (varianza del Laplaciano, resolución normalizada)
   6. Comprimir / Convertir (HEIF, WebP, JPEG)
   7. Estadísticas de carpeta
 
 Dependencias:
   pip install Pillow imagehash pillow-heif opencv-contrib-python==4.10.0.84
+
+Real-ESRGAN (opcional, sin PyTorch ni CUDA; usa GPU vía Vulkan):
+  Descarga realesrgan-ncnn-vulkan desde
+  https://github.com/xinntao/Real-ESRGAN/releases y ponlo en el PATH,
+  en ~/.photo_manager/realesrgan/ (junto a su carpeta models/),
+  o indica la ruta en la variable PHOTO_MANAGER_REALESRGAN.
+
+Las carpetas de salida se marcan con el archivo .photo_manager_output y se
+ignoran en los escaneos, para que nunca se comparen con los originales.
 
 Autor: Josmar Angulo / Claude
 """
@@ -22,8 +32,12 @@ import csv
 import hashlib
 import math
 import os
+import re
 import shutil
+import sqlite3
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from collections import defaultdict
@@ -42,7 +56,7 @@ except ImportError:
 # ══════════════════════════════════════════════════
 
 try:
-    from PIL import Image, ImageFilter
+    from PIL import Image, ImageFilter, ImageOps
     import imagehash
 except ImportError:
     print("Faltan dependencias base. Instala con:")
@@ -77,7 +91,7 @@ if _CV2:
 # CONSTANTES
 # ══════════════════════════════════════════════════
 
-VERSION = "1.6.4"
+VERSION = "1.7.0"
 
 # [FIX #12] Separar formatos soportados por Pillow vs RAW
 PILLOW_EXTENSIONS = {
@@ -105,6 +119,34 @@ MODELS = {
         "desc": "ESPCN ×2 — super-resolución rápida (100 KB)",
     },
 }
+
+# Real-ESRGAN (binario ncnn-vulkan externo)
+REALESRGAN_ENV = "PHOTO_MANAGER_REALESRGAN"
+REALESRGAN_MODEL = "realesrgan-x4plus"      # modelo para fotos reales
+REALESRGAN_DIR = Path.home() / ".photo_manager" / "realesrgan"
+
+# Caché de hashes (idea tomada de czkawka): evita re-decodificar y re-hashear
+CACHE_PATH = Path.home() / ".photo_manager" / "hash_cache.sqlite"
+CACHE_ALGO = 2   # subir si cambia el cálculo del pHash/fecha → invalida caché
+
+# Lado máximo al que se reduce la imagen para medir borrosidad
+BLUR_MAX_SIDE = 1000
+# Tamaño mínimo pedido a JPEG draft() antes del pHash (pHash usa 4×hash_size)
+DRAFT_SIZE = 256
+
+# Carpetas de salida: nunca se escanean como origen
+OUTPUT_MARKER = ".photo_manager_output"
+MANAGED_DIR_NAMES = {
+    "FOTOS_DEDUP", "COMPARACION", "MEJORADAS", "ORGANIZADAS",
+    "COMPRIMIDAS", "_BORROSAS",
+}
+
+# Etiquetas EXIF
+EXIF_IFD = 0x8769
+TAG_DATETIME_ORIGINAL = 36867
+TAG_DATETIME_DIGITIZED = 36868
+TAG_DATETIME = 306            # IFD0: fecha de última modificación/edición
+TAG_ORIENTATION = 274
 
 MESES = {
     1: "01-Enero", 2: "02-Febrero", 3: "03-Marzo", 4: "04-Abril",
@@ -189,113 +231,336 @@ def _validate_source_output(source: Path, output: Path) -> bool:
     return True
 
 
-def find_images(root: Path, exclude: Path | None = None,
-                warn_raw: bool = True) -> list[Path]:
-    """Encuentra imágenes recursivamente y excluye una ruta y sus descendientes."""
+def _unique_path(path: Path) -> Path:
+    """Devuelve path, o path_1, path_2... si ya existe."""
+    if not path.exists():
+        return path
+    stem, sfx, c = path.stem, path.suffix, 1
+    while True:
+        candidate = path.with_name(f"{stem}_{c}{sfx}")
+        if not candidate.exists():
+            return candidate
+        c += 1
+
+
+def _prepare_output_dir(output: Path) -> None:
+    """Crea la carpeta de salida y la marca para excluirla de futuros escaneos."""
+    output.mkdir(parents=True, exist_ok=True)
+    marker = output / OUTPUT_MARKER
+    if not marker.exists():
+        try:
+            marker.write_text(
+                "Carpeta generada por Photo Manager. Se ignora al escanear.\n",
+                encoding="utf-8")
+        except OSError:
+            pass
+
+
+def _is_managed_dir(path: Path) -> bool:
+    """Carpeta de salida de Photo Manager (por nombre conocido o marcador)."""
+    if path.name in MANAGED_DIR_NAMES:
+        return True
+    try:
+        return (path / OUTPUT_MARKER).exists()
+    except OSError:
+        return False
+
+
+def _walk_files(root: Path, exclude: Path | None = None,
+                skip_managed: bool = True, stats: dict | None = None):
+    """os.walk que omite `exclude` y las carpetas de salida de Photo Manager.
+
+    Produce (Path directorio, nombres de archivo). La raíz nunca se omite,
+    así que se puede analizar una carpeta de salida apuntando a ella.
+    """
     root = root.expanduser().resolve()
     excluded = exclude.expanduser().resolve() if exclude else None
-    images, raw_count = [], 0
 
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         # os.walk(followlinks=False) no sigue symlinks: dirpath ya está
         # bajo root resuelto. Evitamos resolve() por directorio (FS call).
         dp = Path(dirpath)
-
-        # Comprobar igualdad/descendencia sin volver a consultar el filesystem.
         if excluded and (dp == excluded or excluded in dp.parents):
             dirnames[:] = []
             continue
+        kept = []
+        for name in dirnames:
+            child = dp / name
+            if excluded and (child == excluded or excluded in child.parents):
+                continue
+            if skip_managed and _is_managed_dir(child):
+                if stats is not None:
+                    stats.setdefault("managed", []).append(child)
+                continue
+            kept.append(name)
+        dirnames[:] = kept
+        yield dp, filenames
 
-        if excluded:
-            kept = []
-            for name in dirnames:
-                child = dp / name
-                if child != excluded and excluded not in child.parents:
-                    kept.append(name)
-            dirnames[:] = kept
 
+def find_images(root: Path, exclude: Path | None = None,
+                warn_raw: bool = True, skip_managed: bool = True) -> list[Path]:
+    """Encuentra imágenes recursivamente.
+
+    Excluye `exclude` y, por defecto, cualquier carpeta de salida de Photo
+    Manager (MEJORADAS, ORGANIZADAS... o marcada con .photo_manager_output):
+    así una copia generada nunca compite con su original en la deduplicación.
+    """
+    images, raw_count, stats = [], 0, {}
+    for dp, filenames in _walk_files(root, exclude, skip_managed, stats):
         for fname in filenames:
             suffix = Path(fname).suffix.lower()
-            if suffix in IMAGE_EXTENSIONS:
-                if suffix in RAW_EXTENSIONS:
-                    raw_count += 1
-                else:
-                    images.append(dp / fname)
+            if suffix in RAW_EXTENSIONS:
+                raw_count += 1
+            elif suffix in PILLOW_EXTENSIONS:
+                images.append(dp / fname)
 
+    managed = stats.get("managed", [])
+    if managed and warn_raw:
+        names = ", ".join(sorted({m.name for m in managed})[:4])
+        print(f"  ℹ {len(managed)} carpeta(s) de salida omitida(s): {names}")
     if raw_count and warn_raw:
         print(f"  ⚠ {raw_count} archivos RAW ignorados (requiere rawpy)")
     return sorted(images)
 
 
-def get_photo_date(filepath: Path) -> datetime | None:
-    """Extrae fecha EXIF o de modificación."""
+# ── Fechas ────────────────────────────────────────
+
+_FILENAME_DATE_RE = re.compile(
+    r"(?<!\d)((?:19|20)\d{2})[-_.]?(0[1-9]|1[0-2])[-_.]?(0[1-9]|[12]\d|3[01])(?!\d)"
+    r"(?:[ _T.-]+(?:at[ _])?([01]\d|2[0-3])[-_.:]?([0-5]\d)[-_.:]?([0-5]\d))?",
+    re.IGNORECASE,
+)
+
+
+def _valid_year(dt: datetime | None) -> datetime | None:
+    return dt if dt and 1900 <= dt.year <= 2100 else None
+
+
+def _parse_exif_datetime(val) -> datetime | None:
+    if isinstance(val, bytes):
+        val = val.decode("ascii", errors="ignore")
+    if not isinstance(val, str):
+        return None
+    val = val.strip().rstrip("\x00")
     try:
-        with Image.open(filepath) as img:
-            # [FIX #19] Usar getexif() en vez de _getexif()
-            exif = img.getexif()
-            if exif:
-                for tag_id in (36867, 36868, 306):
-                    val = exif.get(tag_id)
-                    if val and isinstance(val, str):
-                        try:
-                            return datetime.strptime(val, "%Y:%m:%d %H:%M:%S")
-                        except ValueError:
-                            continue
-    except Exception:
-        pass
-    try:
-        return datetime.fromtimestamp(filepath.stat().st_mtime)
-    except Exception:
+        return _valid_year(datetime.strptime(val[:19], "%Y:%m:%d %H:%M:%S"))
+    except ValueError:
         return None
 
 
-# [FIX #10] Hash SHA-256 streaming en chunks de 1 MB en vez de leer todo en memoria
+def _date_from_filename(name: str) -> datetime | None:
+    """Fecha en nombres tipo IMG_20190505_123456, IMG-20190505-WA0001,
+    'WhatsApp Image 2019-05-05 at 12.34.56', Screenshot_2019-05-05-12-34-56."""
+    for m in _FILENAME_DATE_RE.finditer(name):
+        y, mo, d, hh, mi, ss = m.groups()
+        try:
+            if hh:
+                dt = datetime(int(y), int(mo), int(d), int(hh), int(mi), int(ss))
+            else:
+                dt = datetime(int(y), int(mo), int(d))
+        except ValueError:
+            continue          # p. ej. 30 de febrero
+        if dt <= datetime.now():
+            return dt
+    return None
+
+
+def _exif_dates(exif) -> tuple[datetime | None, datetime | None]:
+    """(fecha de captura, fecha IFD0). DateTimeOriginal/Digitized viven en el
+    sub-IFD Exif (0x8769), no en el IFD0 que devuelve getexif()."""
+    if not exif:
+        return None, None
+    try:
+        sub = exif.get_ifd(EXIF_IFD)
+    except Exception:
+        sub = {}
+    capture = None
+    for tag in (TAG_DATETIME_ORIGINAL, TAG_DATETIME_DIGITIZED):
+        capture = _parse_exif_datetime(sub.get(tag)) or _parse_exif_datetime(exif.get(tag))
+        if capture:
+            break
+    return capture, _parse_exif_datetime(exif.get(TAG_DATETIME))
+
+
+def _mtime_date(filepath: Path) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(filepath.stat().st_mtime)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def resolve_photo_date(filepath: Path, exif=None) -> datetime | None:
+    """Prioridad: EXIF captura → nombre de archivo → EXIF DateTime → mtime.
+
+    DateTime (306) va después del nombre porque es la fecha de edición, y
+    el mtime al final porque en copias/backups es la fecha de la copia.
+    """
+    capture, modified = _exif_dates(exif)
+    return (capture or _date_from_filename(filepath.name)
+            or modified or _mtime_date(filepath))
+
+
+def get_photo_date(filepath: Path) -> datetime | None:
+    """Fecha de la foto (ver resolve_photo_date)."""
+    exif = None
+    try:
+        with Image.open(filepath) as img:
+            exif = img.getexif()
+    except Exception:
+        pass
+    return resolve_photo_date(filepath, exif)
+
+
+class HashCache:
+    """Caché SQLite de pHash + SHA-256 + metadatos por (ruta, tamaño, mtime).
+
+    Si el archivo no cambió (mismo tamaño y mtime_ns), se reutiliza el
+    resultado sin abrirlo. Si SQLite falla, la caché se desactiva sola.
+    """
+
+    MULTIPAGE = "multipage"
+
+    def __init__(self, path: Path | None = None):
+        self.path = path or CACHE_PATH
+        self.conn = None
+        self.hits = self.misses = 0
+        self._pending = 0
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.conn = sqlite3.connect(str(self.path))
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS images (
+                    path TEXT NOT NULL, hash_size INTEGER NOT NULL,
+                    algo INTEGER NOT NULL, size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL, multipage INTEGER NOT NULL,
+                    phash TEXT, file_hash TEXT, width INTEGER, height INTEGER,
+                    date TEXT,
+                    PRIMARY KEY (path, hash_size, algo))""")
+        except (sqlite3.Error, OSError) as e:
+            print(f"  ⚠ Caché de hashes desactivada: {e}")
+            self.conn = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def get(self, filepath: Path, st: os.stat_result, hash_size: int):
+        if not self.conn:
+            return None
+        try:
+            row = self.conn.execute(
+                "SELECT size, mtime_ns, multipage, phash, file_hash, width, height, date "
+                "FROM images WHERE path=? AND hash_size=? AND algo=?",
+                (str(filepath), hash_size, CACHE_ALGO)).fetchone()
+        except sqlite3.Error:
+            return None
+        if not row or row[0] != st.st_size or row[1] != st.st_mtime_ns:
+            self.misses += 1
+            return None
+        self.hits += 1
+        if row[2]:
+            return self.MULTIPAGE
+        _, _, _, phash, file_hash, w, h, date = row
+        return {
+            "path": filepath,
+            "phash": imagehash.hex_to_hash(phash),
+            "resolution": w * h, "width": w, "height": h,
+            "date": datetime.fromisoformat(date),
+            "file_size": st.st_size,
+            "file_hash": file_hash,
+        }
+
+    def put(self, filepath: Path, st: os.stat_result, hash_size: int,
+            info: dict | None, multipage: bool = False):
+        if not self.conn:
+            return
+        try:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO images VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (str(filepath), hash_size, CACHE_ALGO, st.st_size, st.st_mtime_ns,
+                 int(multipage),
+                 None if multipage else str(info["phash"]),
+                 None if multipage else info["file_hash"],
+                 None if multipage else info["width"],
+                 None if multipage else info["height"],
+                 None if multipage else info["date"].isoformat()))
+            self._pending += 1
+            if self._pending >= 200:
+                self.conn.commit()
+                self._pending = 0
+        except sqlite3.Error:
+            pass
+
+    def close(self):
+        if self.conn:
+            try:
+                self.conn.commit()
+                self.conn.close()
+            except sqlite3.Error:
+                pass
+            self.conn = None
+
+
+def _sha256_file(filepath: Path) -> str:
+    digest = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def get_image_info(filepath: Path, hash_size: int = 12,
-                   skip_counts: dict | None = None) -> dict | None:
+                   skip_counts: dict | None = None,
+                   cache: HashCache | None = None) -> dict | None:
     """Hash perceptual + metadata de una imagen.
 
     skip_counts, si se proporciona, acumula motivos de omisión para resumirlos.
+    cache, si se proporciona, evita recalcular archivos sin cambios.
     """
     try:
+        st = filepath.stat()
+        if cache:
+            cached = cache.get(filepath, st, hash_size)
+            if cached == HashCache.MULTIPAGE:
+                if skip_counts is not None:
+                    skip_counts["multipage"] = skip_counts.get("multipage", 0) + 1
+                return None
+            if cached:
+                return cached
+
         with Image.open(filepath) as img:
             if getattr(img, "n_frames", 1) > 1:
                 if skip_counts is not None:
                     skip_counts["multipage"] = skip_counts.get("multipage", 0) + 1
+                if cache:
+                    cache.put(filepath, st, hash_size, None, multipage=True)
                 return None
-            phash = imagehash.phash(img.convert("RGB"), hash_size=hash_size)
-            w, h = img.size
-            exif_date = None
-            try:
-                exif = img.getexif()
-                if exif:
-                    for tag_id in (36867, 306):
-                        val = exif.get(tag_id)
-                        if val and isinstance(val, str):
-                            try:
-                                exif_date = datetime.strptime(val, "%Y:%m:%d %H:%M:%S")
-                                break
-                            except ValueError:
-                                continue
-            except Exception:
-                pass
-            mod_time = datetime.fromtimestamp(filepath.stat().st_mtime)
+            w, h = img.size              # tamaño real, antes de draft()
+            exif = img.getexif()
+            if img.format == "JPEG":
+                # Decodifica a 1/2, 1/4 u 1/8 directamente desde el DCT: el
+                # pHash solo usa 4×hash_size px, así que no cambia el resultado
+                # de forma apreciable y es varias veces más rápido.
+                img.draft("RGB", (DRAFT_SIZE, DRAFT_SIZE))
+            # Hash de la imagen tal como se ve (orientación EXIF aplicada)
+            oriented = ImageOps.exif_transpose(img)
+            phash = imagehash.phash(oriented.convert("RGB"), hash_size=hash_size)
 
-            # Streaming SHA-256
-            file_digest = hashlib.sha256()
-            with open(filepath, "rb") as f:
-                for chunk in iter(lambda: f.read(1 << 20), b""):
-                    file_digest.update(chunk)
-
-            return {
-                "path": filepath,
-                "phash": phash,
-                "resolution": w * h,
-                "width": w,
-                "height": h,
-                "date": exif_date or mod_time,
-                "file_size": filepath.stat().st_size,
-                "file_hash": file_digest.hexdigest(),
-            }
+        info = {
+            "path": filepath,
+            "phash": phash,
+            "resolution": w * h,
+            "width": w,
+            "height": h,
+            "date": resolve_photo_date(filepath, exif) or datetime.fromtimestamp(0),
+            "file_size": st.st_size,
+            "file_hash": _sha256_file(filepath),
+        }
+        if cache:
+            cache.put(filepath, st, hash_size, info)
+        return info
     except Exception as e:
         if skip_counts is not None:
             skip_counts["error"] = skip_counts.get("error", 0) + 1
@@ -479,6 +744,7 @@ def _convert_heif(src: Path, dst: Path, quality: int = 85
     try:
         with Image.open(src) as img:
             exif = img.info.get("exif")
+            icc = img.info.get("icc_profile")
             # [v1.3 C2] Detectar canal alfa — HEIF no soporta alfa
             has_alpha = (
                 img.mode in ("RGBA", "LA", "PA", "La")
@@ -486,13 +752,7 @@ def _convert_heif(src: Path, dst: Path, quality: int = 85
             )
             if has_alpha:
                 # No convertir a HEIF: perdería canal alfa → copiar en formato original
-                fallback = dst.with_suffix(src.suffix)
-                # Anti-colisión en fallback
-                if fallback.exists():
-                    stem, sfx, c = fallback.stem, fallback.suffix, 1
-                    while fallback.exists():
-                        fallback = fallback.parent / f"{stem}_{c}{sfx}"
-                        c += 1
+                fallback = _unique_path(dst.with_suffix(src.suffix))
                 shutil.copy2(str(src), str(fallback))
                 return (fallback, "alpha") if fallback.exists() else (None, None)
             if img.mode not in ("RGB",):
@@ -500,6 +760,8 @@ def _convert_heif(src: Path, dst: Path, quality: int = 85
             kw = {"format": "HEIF", "quality": quality}
             if exif:
                 kw["exif"] = exif
+            if icc:
+                kw["icc_profile"] = icc
             img.save(str(dst), **kw)
             if dst.exists() and dst.stat().st_size > 0:
                 return (dst, None)
@@ -507,13 +769,7 @@ def _convert_heif(src: Path, dst: Path, quality: int = 85
     except Exception:
         # Fallback: copiar en formato original (path distinto a dst)
         try:
-            fallback = dst.with_suffix(src.suffix)
-            # [v1.3 M11] Anti-colisión en fallback
-            if fallback.exists():
-                stem, sfx, c = fallback.stem, fallback.suffix, 1
-                while fallback.exists():
-                    fallback = fallback.parent / f"{stem}_{c}{sfx}"
-                    c += 1
+            fallback = _unique_path(dst.with_suffix(src.suffix))
             shutil.copy2(str(src), str(fallback))
             return (fallback, "exception") if fallback.exists() else (None, None)
         except Exception:
@@ -523,7 +779,8 @@ def _convert_heif(src: Path, dst: Path, quality: int = 85
 def run_dedup(source: Path, output: Path, compare: Path | None = None,
               hash_size: int = 12, threshold: int = 6,
               no_convert: bool = False, quality: int = 85,
-              keep_originals: bool = True, dry_run: bool = False):
+              keep_originals: bool = True, dry_run: bool = False,
+              use_cache: bool = True):
     """Ejecuta deduplicación completa.
 
     Por seguridad, keep_originals=True por defecto: nunca elimina originales
@@ -595,13 +852,21 @@ def run_dedup(source: Path, output: Path, compare: Path | None = None,
     print("  [2/5] Analizando (hash + metadata)...")
     infos = []
     skip_counts = {"multipage": 0, "error": 0, "error_samples": []}
-    for i, img in enumerate(images, 1):
-        if i % 50 == 0 or i == len(images):
-            print(f"    [{i}/{len(images)}]", end="\r")
-        info = get_image_info(img, hash_size, skip_counts=skip_counts)
-        if info:
-            infos.append(info)
+    cache = HashCache() if use_cache else None
+    try:
+        for i, img in enumerate(images, 1):
+            if i % 50 == 0 or i == len(images):
+                print(f"    [{i}/{len(images)}]", end="\r")
+            info = get_image_info(img, hash_size, skip_counts=skip_counts,
+                                  cache=cache)
+            if info:
+                infos.append(info)
+    finally:
+        if cache:
+            cache.close()
     print(f"    {len(infos)} procesadas OK")
+    if cache and cache.hits:
+        print(f"    ⚡ {cache.hits} desde caché (sin re-decodificar)")
     if skip_counts["multipage"]:
         print(f"    ℹ {skip_counts['multipage']} archivo(s) animado(s)/multipágina omitido(s)")
     if skip_counts["error"]:
@@ -674,7 +939,7 @@ def run_dedup(source: Path, output: Path, compare: Path | None = None,
         converting = not no_convert
         action = "Convirtiendo a HEIF" if converting else "Copiando"
         print(f"  [4/5] {action} {len(winners)} imágenes...")
-        output.mkdir(parents=True, exist_ok=True)
+        _prepare_output_dir(output)
 
         orig_total, conv_total = 0, 0
         heic_copied = alpha_copied = exception_copied = 0
@@ -697,13 +962,7 @@ def run_dedup(source: Path, output: Path, compare: Path | None = None,
             else:
                 dst = output / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
-
-            # Colisiones
-            if dst.exists():
-                stem, sfx, c = dst.stem, dst.suffix, 1
-                while dst.exists():
-                    dst = dst.parent / f"{stem}_{c}{sfx}"
-                    c += 1
+            dst = _unique_path(dst)
 
             orig_total += w["file_size"]
             actual_dst = None
@@ -769,7 +1028,7 @@ def run_dedup(source: Path, output: Path, compare: Path | None = None,
             if root_dir:
                 for dp, _, _ in os.walk(root_dir, topdown=False):
                     p = Path(dp)
-                    if p != root_dir and p != output:
+                    if p != root_dir and p != output and not _is_managed_dir(p):
                         try:
                             if not any(p.iterdir()):
                                 p.rmdir()
@@ -812,56 +1071,82 @@ def _ensure_cv2():
     return True
 
 
-# [FIX #7] Leer imagen con fallback a Pillow para HEIC/formatos no-OpenCV
-def _read_image_cv2(img_path: Path):
-    """Lee imagen para OpenCV. Intenta cv2, luego Pillow como fallback."""
-    img = cv2.imread(str(img_path))
-    if img is not None:
-        return img
-    # Fallback: Pillow (soporta HEIC, GIF, etc.)
-    try:
-        with Image.open(img_path) as pil_img:
-            rgb = pil_img.convert("RGB")
-            arr = np.array(rgb)[:, :, ::-1].copy()  # RGB → BGR
-            return arr
-    except Exception:
-        return None
+def _load_oriented_rgb(img_path: Path) -> Image.Image:
+    """Abre con Pillow (soporta HEIC), aplica la orientación EXIF y pasa a RGB.
+
+    Leer siempre por Pillow evita la ambigüedad de v1.6: cv2.imread rotaba
+    según EXIF pero el fallback de Pillow no.
+    """
+    with Image.open(img_path) as opened:
+        if getattr(opened, "n_frames", 1) > 1:
+            raise ValueError("imagen animada/multipágina: omitida")
+        return ImageOps.exif_transpose(opened).convert("RGB")
 
 
-# [FIX H2] Retorna Path escrito o None (caller necesita saber el path real)
-def _write_image_cv2(img, dst: Path, quality: int = 95) -> Path | None:
-    """Escribe imagen. Usa Pillow para HEIF, cv2 para el resto.
-    Retorna el path realmente escrito, o None si falló."""
-    ext = dst.suffix.lower()
+def _pil_to_bgr(img: Image.Image):
+    return np.asarray(img)[:, :, ::-1].copy()
+
+
+def _bgr_to_pil(arr) -> Image.Image:
+    return Image.fromarray(np.ascontiguousarray(arr[:, :, ::-1]))
+
+
+_PIL_SAVE_FORMATS = {
+    ".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG", ".webp": "WEBP",
+    ".tif": "TIFF", ".tiff": "TIFF", ".bmp": "BMP",
+    ".heic": "HEIF", ".heif": "HEIF",
+}
+
+
+def _source_metadata(source: Path) -> dict:
+    """EXIF (con orientación=1, los píxeles ya están rotados), ICC y DPI."""
+    meta = {}
     try:
-        if ext in (".heic", ".heif") and _HEIF:
-            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            pil_out = Image.fromarray(rgb)
-            pil_out.save(str(dst), format="HEIF", quality=quality)
-            return dst if dst.exists() else None
-        else:
-            params = []
-            if ext in (".jpg", ".jpeg"):
-                params = [cv2.IMWRITE_JPEG_QUALITY, quality]
-            elif ext == ".png":
-                params = [cv2.IMWRITE_PNG_COMPRESSION, 3]
-            elif ext == ".webp":
-                params = [cv2.IMWRITE_WEBP_QUALITY, quality]
-            ok = cv2.imwrite(str(dst), img, params if params else None)
-            if ok:
-                return dst
-            # Fallback a JPEG con anti-colisión
-            fallback = dst.with_suffix(".jpg")
-            base = fallback
-            counter = 1
-            while fallback.exists():
-                fallback = base.with_name(f"{base.stem}_{counter}{base.suffix}")
-                counter += 1
-            ok = cv2.imwrite(str(fallback), img,
-                             [cv2.IMWRITE_JPEG_QUALITY, quality])
-            return fallback if ok else None
+        with Image.open(source) as orig:
+            exif = orig.getexif()
+            if exif:
+                if TAG_ORIENTATION in exif:
+                    exif[TAG_ORIENTATION] = 1
+                meta["exif"] = exif.tobytes()
+            if orig.info.get("icc_profile"):
+                meta["icc_profile"] = orig.info["icc_profile"]
+            if orig.info.get("dpi"):
+                meta["dpi"] = orig.info["dpi"]
     except Exception:
-        return None
+        pass
+    return meta
+
+
+def _save_pil(img: Image.Image, dst: Path, source: Path,
+              quality: int = 95) -> tuple[Path | None, bool]:
+    """Guarda en UNA sola codificación, con los metadatos del original.
+
+    v1.6 escribía con OpenCV a q95 y luego Pillow re-guardaba sin `quality`
+    (q75 por defecto): doble pérdida. Retorna (ruta escrita, metadatos_ok).
+    """
+    fmt = _PIL_SAVE_FORMATS.get(dst.suffix.lower())
+    if fmt == "HEIF" and not _HEIF:
+        fmt = None
+    if fmt is None:
+        # GIF y similares → PNG (sin pérdida); resto → JPEG
+        new_ext = ".png" if dst.suffix.lower() == ".gif" else ".jpg"
+        dst = _unique_path(dst.with_suffix(new_ext))
+        fmt = "PNG" if new_ext == ".png" else "JPEG"
+
+    base_kw = {"format": fmt}
+    if fmt in ("JPEG", "WEBP", "HEIF"):
+        base_kw["quality"] = quality
+    meta = _source_metadata(source)
+
+    for with_meta in ((True, False) if meta else (False,)):
+        kw = {**base_kw, **(meta if with_meta else {})}
+        try:
+            img.save(str(dst), **kw)
+            if dst.exists() and dst.stat().st_size > 0:
+                return dst, with_meta or not meta
+        except Exception:
+            dst.unlink(missing_ok=True)
+    return None, False
 
 
 def enhance_clahe(img):
@@ -913,43 +1198,64 @@ def enhance_sharpen(img, amount: float = 0.5):
     return cv2.addWeighted(img, 1 + amount, blurred, -amount, 0)
 
 
-# [FIX #4] Verificar retorno de cv2.imwrite en superres
-def enhance_superres(img_path: Path, output_path: Path,
-                     model_name: str = "fsrcnn_x2",
-                     model_path: Path | None = None) -> Path | None:
-    """Super-resolución con red neuronal (OpenCV dnn_superres)."""
-    if not _SUPERRES:
-        print("  ✗ dnn_superres no disponible. Necesitas opencv-contrib-python==4.10.0.84")
-        return None
-
-    # [v1.4] Usar model_path pre-descargado si se pasa; si no, descargar
-    if model_path is None:
-        model_path = download_model(model_name)
-    if not model_path:
-        return None
-
+def _make_superres(model_name: str, model_path: Path):
+    """Crea y configura UNA vez la red de super-resolución de OpenCV."""
     info = MODELS[model_name]
     sr = cv2.dnn_superres.DnnSuperResImpl_create()
     sr.readModel(str(model_path))
     sr.setModel(info["algo"], info["scale"])
+    return sr
 
-    img = _read_image_cv2(img_path)
-    if img is None:
-        print(f"  ✗ No se pudo leer: {img_path.name}")
-        return None
 
-    # Validar tamaño mínimo para superres
-    h, w = img.shape[:2]
-    if h < 8 or w < 8:
-        print(f"  ⚠ Imagen demasiado pequeña para superres ({w}x{h}): {img_path.name}")
-        return None
+def find_realesrgan() -> Path | None:
+    """Busca realesrgan-ncnn-vulkan: variable de entorno → PATH → ~/.photo_manager."""
+    env = os.environ.get(REALESRGAN_ENV)
+    if env:
+        p = Path(env).expanduser()
+        return p if p.is_file() else None
+    found = shutil.which("realesrgan-ncnn-vulkan")
+    if found:
+        return Path(found)
+    for name in ("realesrgan-ncnn-vulkan", "realesrgan-ncnn-vulkan.exe"):
+        p = REALESRGAN_DIR / name
+        if p.is_file():
+            return p
+    return None
 
-    result = sr.upsample(img)
-    written = _write_image_cv2(result, output_path)
-    if not written:
-        print(f"  ✗ No se pudo escribir: {output_path}")
-        return None
-    return written
+
+def realesrgan_upscale(img: Image.Image, exe: Path, out_scale: int = 2,
+                       timeout: int = 900) -> Image.Image:
+    """Super-resolución con Real-ESRGAN (x4plus) y reducción LANCZOS a ×out_scale.
+
+    El modelo x4plus solo trabaja a ×4; reducir a ×2 da mejor resultado que
+    un modelo ×2 débil y evita archivos 16 veces más grandes.
+    """
+    with tempfile.TemporaryDirectory(prefix="pm_esrgan_") as tmp:
+        src = Path(tmp) / "in.png"
+        dst = Path(tmp) / "out.png"
+        img.save(src)
+        cmd = [str(exe), "-i", str(src), "-o", str(dst),
+               "-n", REALESRGAN_MODEL, "-s", "4", "-f", "png"]
+        models = exe.parent / "models"
+        if models.is_dir():
+            cmd += ["-m", str(models)]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True,
+                                 timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Real-ESRGAN superó {timeout}s")
+        # El binario a veces sale con código 0 aunque falle Vulkan: comprobar salida
+        if res.returncode != 0 or not dst.exists():
+            detail = (res.stderr or res.stdout or "").strip().splitlines()
+            raise RuntimeError("Real-ESRGAN falló"
+                               + (f": {detail[-1]}" if detail else
+                                  f" (código {res.returncode}, sin salida)"))
+        with Image.open(dst) as up:
+            up = up.convert("RGB")
+            target = (img.width * out_scale, img.height * out_scale)
+            if up.size != target:
+                up = up.resize(target, Image.Resampling.LANCZOS)
+            return up
 
 
 def enhance_auto(img):
@@ -962,67 +1268,64 @@ def enhance_auto(img):
     return img
 
 
-def _restore_metadata(source: Path, destination: Path) -> bool:
-    """Restaura EXIF, ICC y DPI. Devuelve False si no pudo restaurarlos."""
-    try:
-        with Image.open(source) as original:
-            if getattr(original, "n_frames", 1) > 1:
-                return True
-            exif = original.getexif()
-            # OpenCV aplica normalmente la orientación EXIF al leer.
-            if exif and 274 in exif:
-                exif[274] = 1
-            exif_bytes = exif.tobytes() if exif else None
-            icc = original.info.get("icc_profile")
-            dpi = original.info.get("dpi")
-
-        with Image.open(destination) as processed:
-            save_kwargs = {}
-            if exif_bytes:
-                save_kwargs["exif"] = exif_bytes
-            if icc:
-                save_kwargs["icc_profile"] = icc
-            if dpi:
-                save_kwargs["dpi"] = dpi
-            if save_kwargs:
-                temp = destination.with_name(
-                    destination.stem + "_metadata_tmp" + destination.suffix
-                )
-                try:
-                    processed.save(temp, format=processed.format, **save_kwargs)
-                    os.replace(temp, destination)
-                finally:
-                    if temp.exists():
-                        temp.unlink(missing_ok=True)
-        return True
-    except Exception:
-        return False
+ENHANCE_FILTERS = {
+    "auto": enhance_auto,
+    "clahe": enhance_clahe,
+    "denoise": lambda img: enhance_denoise(img, strength=8),
+    "gamma": enhance_gamma,
+    "sharpen": lambda img: enhance_sharpen(img, amount=0.6),
+}
 
 
 def run_enhance(source: Path, output: Path, mode: str):
-    """Ejecuta mejora de fotos."""
-    if not _ensure_cv2():
+    """Ejecuta mejora de fotos.
+
+    Modos: auto, clahe, denoise, gamma, sharpen (OpenCV);
+    superres_fsrcnn, superres_espcn (OpenCV dnn_superres);
+    realesrgan (binario externo realesrgan-ncnn-vulkan).
+    """
+    if mode != "realesrgan" and not _ensure_cv2():
+        return
+    if not _NUMPY:
+        print("  ✗ Requiere numpy.")
         return
 
     source = source.expanduser().resolve()
     output = output.expanduser().resolve()
     if not _validate_source_output(source, output):
         return
-    images = find_images(source, exclude=output)
-    if not images:
-        print("  No se encontraron imágenes.")
-        return
 
-    # [v1.3 H6] Pre-descargar modelo UNA vez antes del loop
-    if mode.startswith("superres"):
+    sr = esrgan = None
+    if mode == "realesrgan":
+        esrgan = find_realesrgan()
+        if not esrgan:
+            print("  ✗ No se encontró realesrgan-ncnn-vulkan.")
+            print("    Descárgalo de https://github.com/xinntao/Real-ESRGAN/releases")
+            print(f"    y ponlo en el PATH, en {REALESRGAN_DIR}, o en ${REALESRGAN_ENV}.")
+            return
+    elif mode.startswith("superres"):
+        if not _SUPERRES:
+            print("  ✗ dnn_superres no disponible. Necesitas opencv-contrib-python==4.10.0.84")
+            return
+        # [v1.3 H6] Descargar y cargar el modelo UNA vez antes del loop
         model_name = "espcn_x2" if mode == "superres_espcn" else "fsrcnn_x2"
         model_path = download_model(model_name)
         if not model_path:
             print("  ✗ No se pudo obtener el modelo. Abortando.")
             return
+        sr = _make_superres(model_name, model_path)
+    elif mode not in ENHANCE_FILTERS:
+        print(f"  ✗ Modo desconocido: {mode}")
+        return
 
-    output.mkdir(parents=True, exist_ok=True)
+    images = find_images(source, exclude=output)
+    if not images:
+        print("  No se encontraron imágenes.")
+        return
+
+    _prepare_output_dir(output)
     print(f"  {len(images)} imágenes a procesar\n")
+    upscaling = sr is not None or esrgan is not None
 
     ok, errors, metadata_warnings = 0, 0, 0
     t0 = time.time()
@@ -1033,66 +1336,37 @@ def run_enhance(source: Path, output: Path, mode: str):
         except ValueError:
             rel = Path(img_path.name)
         dst = output / rel
-        # La salida debe ser distinta del origen; nunca sobrescribir un archivo.
+        if upscaling:
+            dst = dst.with_stem(dst.stem + "_x2")
         dst.parent.mkdir(parents=True, exist_ok=True)
-        if str(dst) == str(img_path) or dst.resolve() == img_path.resolve():
+        dst = _unique_path(dst)
+        if dst.resolve() == img_path.resolve():
             print(f"  ✗ Ruta de salida coincide con el original: {img_path}")
             errors += 1
             continue
-        if not mode.startswith("superres") and dst.exists():
-            stem, suffix, c = dst.stem, dst.suffix, 1
-            while dst.exists():
-                dst = dst.with_name(f"{stem}_{c}{suffix}")
-                c += 1
 
         try:
-            if mode.startswith("superres"):
-                model = "espcn_x2" if mode == "superres_espcn" else "fsrcnn_x2"
-                # [FIX C3] Anti-colisión con base fija fuera del loop
-                base = dst.with_stem(dst.stem + "_x2")
-                dst = base
-                c = 1
-                while dst.exists():
-                    dst = base.parent / f"{base.stem}_{c}{base.suffix}"
-                    c += 1
-                enhanced_path = enhance_superres(
-                    img_path, dst, model_name=model, model_path=model_path
-                )
-                if not enhanced_path:
-                    errors += 1
-                    continue
-                if not _restore_metadata(img_path, enhanced_path):
-                    metadata_warnings += 1
+            pil = _load_oriented_rgb(img_path)
+            if esrgan:
+                result = realesrgan_upscale(pil, esrgan)
             else:
-                # Evitar convertir silenciosamente GIF animados o TIFF multipágina.
-                with Image.open(img_path) as check_img:
-                    if getattr(check_img, "n_frames", 1) > 1:
-                        raise ValueError("imagen animada/multipágina: omitida")
-                # [FIX #7] Leer con fallback a Pillow
-                img = _read_image_cv2(img_path)
-                if img is None:
-                    errors += 1
-                    continue
+                arr = _pil_to_bgr(pil)
+                if sr is not None:
+                    h, w = arr.shape[:2]
+                    if h < 8 or w < 8:
+                        raise ValueError(f"demasiado pequeña para superres ({w}x{h})")
+                    arr = sr.upsample(arr)
+                else:
+                    arr = ENHANCE_FILTERS[mode](arr)
+                result = _bgr_to_pil(arr)
 
-                if mode == "auto":
-                    img = enhance_auto(img)
-                elif mode == "clahe":
-                    img = enhance_clahe(img)
-                elif mode == "denoise":
-                    img = enhance_denoise(img, strength=8)
-                elif mode == "gamma":
-                    img = enhance_gamma(img)
-                elif mode == "sharpen":
-                    img = enhance_sharpen(img, amount=0.6)
-
-                written = _write_image_cv2(img, dst)
-                if not written:
-                    print(f"  ⚠ No se pudo escribir: {dst.name}")
-                    errors += 1
-                    continue
-                if not _restore_metadata(img_path, written):
-                    metadata_warnings += 1
-
+            written, meta_ok = _save_pil(result, dst, img_path)
+            if not written:
+                print(f"  ⚠ No se pudo escribir: {dst.name}")
+                errors += 1
+                continue
+            if not meta_ok:
+                metadata_warnings += 1
             ok += 1
         except Exception as e:
             print(f"  ⚠ {img_path.name}: {e}")
@@ -1123,7 +1397,7 @@ def run_organize(source: Path, output: Path, move: bool = False):
         print("  No se encontraron imágenes.")
         return
 
-    output.mkdir(parents=True, exist_ok=True)
+    _prepare_output_dir(output)
     organized = 0
     no_date = 0
 
@@ -1149,12 +1423,7 @@ def run_organize(source: Path, output: Path, move: bool = False):
             organized += 1
             continue
 
-        # Colisión
-        if dst.exists():
-            stem, sfx, c = dst.stem, dst.suffix, 1
-            while dst.exists():
-                dst = dst.parent / f"{stem}_{c}{sfx}"
-                c += 1
+        dst = _unique_path(dst)
 
         try:
             if move:
@@ -1171,14 +1440,14 @@ def run_organize(source: Path, output: Path, move: bool = False):
     action = "movidas" if move else "copiadas"
     print(f"\n\n  ✓ {organized} fotos {action}")
     if no_date:
-        print(f"  ℹ {no_date} sin fecha EXIF → Sin_fecha/")
+        print(f"  ℹ {no_date} sin fecha válida → Sin_fecha/")
     print(f"  ✓ Resultado en: {output}")
 
     # Limpiar directorios vacíos si movimos
     if move:
         for dp, _, _ in os.walk(source, topdown=False):
             p = Path(dp)
-            if p != source and p != output:
+            if p != source and p != output and not _is_managed_dir(p):
                 try:
                     if not any(p.iterdir()):
                         p.rmdir()
@@ -1192,45 +1461,42 @@ def run_organize(source: Path, output: Path, move: bool = False):
 
 
 def blur_score(filepath: Path) -> float | None:
-    """Varianza del Laplaciano — menor = más borrosa."""
-    if not _CV2:
-        # Fallback con Pillow
-        # [v1.3 H5] Verificar numpy antes de usarlo
-        if not _NUMPY:
-            # Sin numpy ni cv2: varianza streaming (sin materializar lista)
-            try:
-                with Image.open(filepath) as img:
-                    gray = img.convert("L")
-                    edges = gray.filter(ImageFilter.FIND_EDGES)
-                    n = s = s2 = 0
-                    for p in edges.getdata():
-                        n += 1
-                        s += p
-                        s2 += p * p
-                    if n == 0:
-                        return None
-                    mean = s / n
-                    return float(s2 / n - mean * mean)
-            except Exception:
-                return None
-        try:
-            with Image.open(filepath) as img:
-                gray = img.convert("L")
-                edges = gray.filter(ImageFilter.FIND_EDGES)
-                arr = np.array(edges, dtype="float64")
-                return float(arr.var())
-        except Exception:
-            return None
+    """Varianza del Laplaciano — menor = más borrosa.
+
+    La imagen se reduce primero a BLUR_MAX_SIDE px de lado mayor: sin esto,
+    la misma escena puntuaba ~30 veces distinto a 4000 px que a 1000 px y
+    un umbral fijo no significaba nada.
+    """
     try:
-        img = cv2.imread(str(filepath), cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            # Fallback Pillow para HEIC
-            try:
-                with Image.open(filepath) as pil:
-                    img = np.array(pil.convert("L"))
-            except Exception:
-                return None
-        return cv2.Laplacian(img, cv2.CV_64F).var()
+        with Image.open(filepath) as img:
+            if img.format == "JPEG":
+                img.draft("L", (BLUR_MAX_SIDE, BLUR_MAX_SIDE))
+            gray = img.convert("L")
+        if max(gray.size) > BLUR_MAX_SIDE:
+            gray.thumbnail((BLUR_MAX_SIDE, BLUR_MAX_SIDE), Image.Resampling.BOX)
+    except Exception:
+        return None
+
+    try:
+        if _CV2:
+            return float(cv2.Laplacian(np.asarray(gray), cv2.CV_64F).var())
+        # Sin OpenCV: mismo kernel Laplaciano 3×3 con Pillow. Aproximado:
+        # Pillow recorta la respuesta a ±127, OpenCV no.
+        lap = ImageFilter.Kernel((3, 3), (0, 1, 0, 1, -4, 1, 0, 1, 0),
+                                 scale=1, offset=128)
+        edges = gray.filter(lap)
+        if _NUMPY:
+            return float((np.asarray(edges, dtype="float64") - 128).var())
+        n = s = s2 = 0
+        for px in edges.getdata():
+            v = px - 128
+            n += 1
+            s += v
+            s2 += v * v
+        if n == 0:
+            return None
+        mean = s / n
+        return float(s2 / n - mean * mean)
     except Exception:
         return None
 
@@ -1276,7 +1542,7 @@ def run_blur_detect(source: Path, threshold: float = 100.0,
     moved_paths = {}  # original_path → new_path
 
     if blurry:
-        print(f"\n  Top 10 más borrosas:")
+        print("\n  Top 10 más borrosas:")
         for path, score in blurry[:10]:
             print(f"    {score:8.1f}  {path.name}")
 
@@ -1286,20 +1552,24 @@ def run_blur_detect(source: Path, threshold: float = 100.0,
             if blur_dir.exists() and not blur_dir.is_dir():
                 print(f"  ✗ {blur_dir} existe pero no es un directorio.")
             else:
-                blur_dir.mkdir(exist_ok=True)
+                _prepare_output_dir(blur_dir)
                 moved = 0
                 for path, _ in blurry:
                     try:
-                        dst = blur_dir / path.name
-                        c = 0
-                        while dst.exists():
-                            dst = blur_dir / f"{path.stem}_{c}{path.suffix}"
-                            c += 1
+                        # Conserva la estructura de subcarpetas para poder
+                        # devolver cada foto a su sitio.
+                        try:
+                            rel = path.relative_to(source)
+                        except ValueError:
+                            rel = Path(path.name)
+                        dst = blur_dir / rel
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        dst = _unique_path(dst)
                         shutil.move(str(path), str(dst))
                         moved_paths[path] = dst
                         moved += 1
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"  ⚠ No se pudo mover {path.name}: {e}")
                 print(f"\n  ✓ {moved} borrosas movidas a {blur_dir}")
 
     # [FIX v1.5+] Reporte CSV en _BORROSAS (si existe) o junto a source, nunca dentro de source
@@ -1310,16 +1580,16 @@ def run_blur_detect(source: Path, threshold: float = 100.0,
     try:
         with open(report, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["archivo", "score", "estado"])
+            # archivo_original permite deshacer el movimiento
+            w.writerow(["archivo_original", "archivo_actual", "score", "estado"])
             for path, score in blurry:
-                # Usar path post-move si fue movido
-                actual = moved_paths.get(path, path) if move_blurry else path
-                w.writerow([str(actual), f"{score:.1f}", "BORROSA"])
+                actual = moved_paths.get(path, path)
+                w.writerow([str(path), str(actual), f"{score:.1f}", "BORROSA"])
             for path, score in sharp:
-                w.writerow([str(path), f"{score:.1f}", "NITIDA"])
+                w.writerow([str(path), str(path), f"{score:.1f}", "NITIDA"])
             # [v1.3 H4] Incluir archivos no analizados en el reporte
             for path in skipped:
-                w.writerow([str(path), "", "NO_ANALIZADA"])
+                w.writerow([str(path), str(path), "", "NO_ANALIZADA"])
         print(f"  ✓ Reporte: {report}")
     except Exception as e:
         print(f"  ⚠ No se pudo escribir reporte: {e}")
@@ -1346,7 +1616,7 @@ def run_compress(source: Path, output: Path, fmt: str = "heif",
         print("  ✗ HEIF no disponible. Instala: pip install pillow-heif")
         return
 
-    output.mkdir(parents=True, exist_ok=True)
+    _prepare_output_dir(output)
     print(f"  {len(images)} imágenes → {fmt.upper()} (q={quality})\n")
 
     orig_total, conv_total = 0, 0
@@ -1366,13 +1636,7 @@ def run_compress(source: Path, output: Path, fmt: str = "heif",
             dst = output / (img_path.stem + target_ext)
 
         dst.parent.mkdir(parents=True, exist_ok=True)
-
-        # Colisión
-        if dst.exists():
-            stem, sfx, c = dst.stem, dst.suffix, 1
-            while dst.exists():
-                dst = dst.parent / f"{stem}_{c}{sfx}"
-                c += 1
+        dst = _unique_path(dst)
 
         orig_size = img_path.stat().st_size
         orig_total += orig_size
@@ -1448,10 +1712,10 @@ def run_stats(source: Path):
     images = find_images(source, warn_raw=False)
 
     raw_files = []
-    for dirpath, _, filenames in os.walk(source):
+    for dp, filenames in _walk_files(source):
         for fname in filenames:
             if Path(fname).suffix.lower() in RAW_EXTENSIONS:
-                raw_files.append(Path(dirpath) / fname)
+                raw_files.append(dp / fname)
 
     if not images and not raw_files:
         print("  No se encontraron imágenes ni archivos RAW.")
@@ -1498,26 +1762,9 @@ def run_stats(source: Path):
                 else:
                     res_buckets["> 20 MP"] += 1
 
-                date_added = False
-                try:
-                    exif = img.getexif()
-                    if exif:
-                        for tag_id in (36867, 36868, 306):
-                            val = exif.get(tag_id)
-                            if isinstance(val, str) and val:
-                                try:
-                                    dates.append(datetime.strptime(val, "%Y:%m:%d %H:%M:%S"))
-                                    date_added = True
-                                    break
-                                except ValueError:
-                                    continue
-                except Exception:
-                    pass
-                if not date_added:
-                    try:
-                        dates.append(datetime.fromtimestamp(img_path.stat().st_mtime))
-                    except (OSError, OverflowError, ValueError):
-                        pass
+                date = resolve_photo_date(img_path, img.getexif())
+                if date:
+                    dates.append(date)
         except Exception:
             # Cabecera OK pero metadata ilegible: no es "unreadable" total,
             # pero no podemos bucketizar. Lo dejamos fuera de resolución/fecha.
@@ -1627,15 +1874,18 @@ def menu_compare():
         no_convert = not ask_confirm("¿Convertir a HEIF?", default_yes=True)
     quality = ask_int("Calidad", 85, min_val=1, max_val=100) if not no_convert else 85
     keep = ask_confirm("¿Conservar originales?", default_yes=True)
+    dry_run = ask_confirm("¿Solo simular (dry run)?", default_yes=False)
 
     run_dedup(source, output, compare=compare, threshold=threshold,
-              no_convert=no_convert, quality=quality, keep_originals=keep)
+              no_convert=no_convert, quality=quality, keep_originals=keep,
+              dry_run=dry_run)
 
 
 def menu_enhance():
-    banner("MEJORAR FOTOS (OpenCV / red neuronal)")
-    if not _CV2:
-        print("  ✗ Requiere OpenCV. Instala:")
+    banner("MEJORAR FOTOS (OpenCV / super-resolución)")
+    esrgan = find_realesrgan()
+    if not _CV2 and not esrgan:
+        print("  ✗ Requiere OpenCV o Real-ESRGAN. Instala:")
         print("    pip install opencv-contrib-python==4.10.0.84")
         return
 
@@ -1646,29 +1896,43 @@ def menu_enhance():
     if not output:
         output = source / "MEJORADAS"
 
-    sr_tag = " (IA)" if _SUPERRES else " (no disponible)"
+    cv_tag = "" if _CV2 else " (no disponible)"
+    sr_tag = "" if _SUPERRES else " (no disponible)"
+    es_tag = " (recomendado)" if esrgan else " (no instalado)"
     print(f"""
   Modos de mejora:
-    1. Auto-enhance (contraste + color + nitidez)
-    2. Super-resolución neuronal FSRCNN ×2{sr_tag}
-    3. Super-resolución neuronal ESPCN ×2{sr_tag}
-    4. Reducir ruido
-    5. Corregir contraste (CLAHE)
-    6. Corregir iluminación (gamma)
-    7. Aumentar nitidez (sharpen)
+    1. Ajuste automático (contraste + color + nitidez){cv_tag}
+    2. Super-resolución ×2 Real-ESRGAN{es_tag}
+    3. Super-resolución ×2 FSRCNN (ligera){sr_tag}
+    4. Super-resolución ×2 ESPCN (ligera){sr_tag}
+    5. Reducir ruido{cv_tag}
+    6. Corregir contraste (CLAHE){cv_tag}
+    7. Corregir iluminación (gamma){cv_tag}
+    8. Aumentar nitidez (sharpen){cv_tag}
+
+  ℹ FSRCNN/ESPCN apenas superan a un reescalado bicúbico en fotos reales.
 """)
-    opt = ask("Modo", "1")
+    opt = ask("Modo", "2" if esrgan else "1")
     mode_map = {
-        "1": "auto", "2": "superres_fsrcnn", "3": "superres_espcn",
-        "4": "denoise", "5": "clahe", "6": "gamma", "7": "sharpen",
+        "1": "auto", "2": "realesrgan", "3": "superres_fsrcnn",
+        "4": "superres_espcn", "5": "denoise", "6": "clahe",
+        "7": "gamma", "8": "sharpen",
     }
     mode = mode_map.get(opt)
     if not mode:
         print("  Opción no válida.")
         return
 
+    if mode == "realesrgan" and not esrgan:
+        print("  ✗ Real-ESRGAN no instalado. Descarga realesrgan-ncnn-vulkan de")
+        print("    https://github.com/xinntao/Real-ESRGAN/releases")
+        print(f"    y ponlo en el PATH o en {REALESRGAN_DIR}")
+        return
     if mode.startswith("superres") and not _SUPERRES:
         print("  ✗ dnn_superres no disponible. Instala opencv-contrib-python==4.10.0.84")
+        return
+    if mode != "realesrgan" and not _CV2:
+        print("  ✗ Este modo requiere OpenCV.")
         return
 
     run_enhance(source, output, mode)
@@ -1750,7 +2014,9 @@ def main_menu():
         if _CV2:
             deps.append("OpenCV")
         if _SUPERRES:
-            deps.append("SuperRes-IA")
+            deps.append("SuperRes")
+        if find_realesrgan():
+            deps.append("ESRGAN")
         dep_str = " + ".join(deps) if deps else "solo Pillow"
 
         print(f"""
@@ -1760,7 +2026,7 @@ def main_menu():
 ║                                              ║
 ║  1. Deduplicar fotos                         ║
 ║  2. Comparar dos carpetas                    ║
-║  3. Mejorar fotos (OpenCV / red neuronal)    ║
+║  3. Mejorar fotos (OpenCV / super-res.)      ║
 ║  4. Organizar por fecha                      ║
 ║  5. Detectar fotos borrosas                  ║
 ║  6. Comprimir / Convertir                    ║
