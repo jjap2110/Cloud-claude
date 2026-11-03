@@ -53,6 +53,10 @@ def isolated_home(tmp_path, monkeypatch):
     monkeypatch.setattr(pm, "CACHE_PATH", home / "hash_cache.sqlite")
     monkeypatch.setattr(pm, "ask_confirm", lambda *a, **k: True)
     monkeypatch.delenv(pm.REALESRGAN_ENV, raising=False)
+    # No detectar una instalación real de Real-ESRGAN en la máquina de tests
+    monkeypatch.setattr(pm, "SCRIPT_DIR", tmp_path / "_script")
+    monkeypatch.setattr(pm, "REALESRGAN_DIR", home / "realesrgan")
+    monkeypatch.setattr(pm.shutil, "which", lambda *a, **k: None)
     yield
 
 
@@ -462,3 +466,37 @@ def test_auto_copies_untouched_photos_byte_for_byte(tmp_path):
     Image.fromarray(photo()[:, :, ::-1]).save(src / "buena.jpg", quality=92)
     pm.run_enhance(src, out, "auto")
     assert (out / "buena.jpg").read_bytes() == (src / "buena.jpg").read_bytes()
+
+
+# ──────────────────────────────────────────────────────────────
+# Localizar Real-ESRGAN
+# ──────────────────────────────────────────────────────────────
+
+def _fake_exe(path: Path, executable: bool = True) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n")
+    path.chmod(0o755 if executable else 0o644)
+    return path
+
+
+def test_find_realesrgan_next_to_script():
+    exe = _fake_exe(pm.SCRIPT_DIR / "realesrgan" / "realesrgan-ncnn-vulkan")
+    assert pm.find_realesrgan() == exe
+
+
+def test_find_realesrgan_in_nested_zip_folder():
+    exe = _fake_exe(pm.SCRIPT_DIR / "realesrgan"
+                    / "realesrgan-ncnn-vulkan-20220424-ubuntu" / "realesrgan-ncnn-vulkan")
+    assert pm.find_realesrgan() == exe
+
+
+@pytest.mark.skipif(os.name == "nt", reason="permisos POSIX")
+def test_find_realesrgan_restores_exec_permission():
+    exe = _fake_exe(pm.SCRIPT_DIR / "realesrgan" / "realesrgan-ncnn-vulkan",
+                    executable=False)
+    assert pm.find_realesrgan() == exe
+    assert os.access(exe, os.X_OK)
+
+
+def test_find_realesrgan_none_when_missing():
+    assert pm.find_realesrgan() is None

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Photo Manager CLI v1.8.0
+Photo Manager CLI v1.8.1
 Herramienta completa de gestión de fotos.
 
 Funcionalidades:
@@ -20,9 +20,9 @@ Dependencias:
 
 Real-ESRGAN (opcional, sin PyTorch ni CUDA; usa GPU vía Vulkan):
   Descarga realesrgan-ncnn-vulkan desde
-  https://github.com/xinntao/Real-ESRGAN/releases y ponlo en el PATH,
-  en ~/.photo_manager/realesrgan/ (junto a su carpeta models/),
-  o indica la ruta en la variable PHOTO_MANAGER_REALESRGAN.
+  https://github.com/xinntao/Real-ESRGAN/releases y descomprímelo en una
+  carpeta "realesrgan" junto a este script (o en ~/.photo_manager/realesrgan/),
+  o indica la ruta del ejecutable en la variable PHOTO_MANAGER_REALESRGAN.
 
 Las carpetas de salida se marcan con el archivo .photo_manager_output y se
 ignoran en los escaneos, para que nunca se comparen con los originales.
@@ -93,7 +93,7 @@ if _CV2:
 # CONSTANTES
 # ══════════════════════════════════════════════════
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 
 # [FIX #12] Separar formatos soportados por Pillow vs RAW
 PILLOW_EXTENSIONS = {
@@ -126,6 +126,7 @@ MODELS = {
 REALESRGAN_ENV = "PHOTO_MANAGER_REALESRGAN"
 REALESRGAN_MODEL = "realesrgan-x4plus"      # modelo para fotos reales
 REALESRGAN_DIR = Path.home() / ".photo_manager" / "realesrgan"
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 # Caché de hashes (idea tomada de czkawka): evita re-decodificar y re-hashear
 CACHE_PATH = Path.home() / ".photo_manager" / "hash_cache.sqlite"
@@ -1229,20 +1230,52 @@ def _make_superres(model_name: str, model_path: Path):
     return sr
 
 
+_REALESRGAN_NAMES = ("realesrgan-ncnn-vulkan", "realesrgan-ncnn-vulkan.exe")
+
+
+def _realesrgan_search_dirs() -> list[Path]:
+    """Carpeta 'realesrgan' junto al script y ~/.photo_manager/realesrgan."""
+    return [SCRIPT_DIR / "realesrgan", REALESRGAN_DIR]
+
+
+def _ensure_executable(path: Path) -> Path:
+    """Algunos descompresores pierden el permiso de ejecución: restaurarlo."""
+    if os.name != "nt" and not os.access(path, os.X_OK):
+        try:
+            path.chmod(path.stat().st_mode | 0o111)
+        except OSError:
+            pass
+    return path
+
+
 def find_realesrgan() -> Path | None:
-    """Busca realesrgan-ncnn-vulkan: variable de entorno → PATH → ~/.photo_manager."""
+    """Busca realesrgan-ncnn-vulkan, en este orden:
+
+    1. Variable de entorno PHOTO_MANAGER_REALESRGAN
+    2. Carpeta 'realesrgan' junto a photo_manager.py
+    3. ~/.photo_manager/realesrgan
+    4. PATH del sistema
+    En 2 y 3 también mira un nivel más adentro, por si el zip se
+    descomprimió dentro de su propia subcarpeta.
+    """
     env = os.environ.get(REALESRGAN_ENV)
     if env:
         p = Path(env).expanduser()
-        return p if p.is_file() else None
+        return _ensure_executable(p) if p.is_file() else None
+    for base in _realesrgan_search_dirs():
+        if not base.is_dir():
+            continue
+        candidates = [base / n for n in _REALESRGAN_NAMES]
+        try:
+            candidates += sorted(c for sub in base.iterdir() if sub.is_dir()
+                                 for c in (sub / n for n in _REALESRGAN_NAMES))
+        except OSError:
+            pass
+        for p in candidates:
+            if p.is_file():
+                return _ensure_executable(p)
     found = shutil.which("realesrgan-ncnn-vulkan")
-    if found:
-        return Path(found)
-    for name in ("realesrgan-ncnn-vulkan", "realesrgan-ncnn-vulkan.exe"):
-        p = REALESRGAN_DIR / name
-        if p.is_file():
-            return p
-    return None
+    return Path(found) if found else None
 
 
 def realesrgan_upscale(img: Image.Image, exe: Path, out_scale: int = 2,
@@ -1494,7 +1527,7 @@ def run_enhance(source: Path, output: Path, mode: str):
         if not esrgan:
             print("  ✗ No se encontró realesrgan-ncnn-vulkan.")
             print("    Descárgalo de https://github.com/xinntao/Real-ESRGAN/releases")
-            print(f"    y ponlo en el PATH, en {REALESRGAN_DIR}, o en ${REALESRGAN_ENV}.")
+            print(f"    y descomprímelo en {SCRIPT_DIR / 'realesrgan'}")
             return
     elif mode.startswith("superres"):
         if not _SUPERRES:
@@ -2170,7 +2203,7 @@ def menu_enhance():
     if mode == "realesrgan" and not esrgan:
         print("  ✗ Real-ESRGAN no instalado. Descarga realesrgan-ncnn-vulkan de")
         print("    https://github.com/xinntao/Real-ESRGAN/releases")
-        print(f"    y ponlo en el PATH o en {REALESRGAN_DIR}")
+        print(f"    y descomprímelo en {SCRIPT_DIR / 'realesrgan'}")
         return
     if mode.startswith("superres") and not _SUPERRES:
         print("  ✗ dnn_superres no disponible. Instala opencv-contrib-python==4.10.0.84")
