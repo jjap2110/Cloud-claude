@@ -293,12 +293,20 @@ def test_draft_keeps_real_dimensions(tmp_path):
 
 FAKE_ESRGAN = textwrap.dedent("""\
     #!{python}
+    # Simula realesrgan-ncnn-vulkan: archivo o carpeta, ×s, porcentajes en stderr
     import sys
+    from pathlib import Path
     from PIL import Image
     args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
     s = int(args["-s"])
-    with Image.open(args["-i"]) as im:
-        im.resize((im.width * s, im.height * s)).save(args["-o"])
+    src, dst = Path(args["-i"]), Path(args["-o"])
+    pairs = ([(f, dst / (f.stem + ".png")) for f in sorted(src.iterdir())]
+             if src.is_dir() else [(src, dst)])
+    for f, out in pairs:
+        for pct in ("0.00%", "50.00%", "100.00%"):
+            print(pct, file=sys.stderr, flush=True)
+        with Image.open(f) as im:
+            im.resize((im.width * s, im.height * s)).save(out)
 """)
 
 
@@ -573,3 +581,110 @@ def test_script_folder_has_priority_over_env(tmp_path, monkeypatch):
     other = _fake_exe(tmp_path / "otro" / "realesrgan-ncnn-vulkan")
     monkeypatch.setenv(pm.REALESRGAN_ENV, str(other))
     assert pm.find_realesrgan() == local
+
+
+# ──────────────────────────────────────────────────────────────
+# Rendimiento: paralelo, lotes de Real-ESRGAN, indicador de avance
+# ──────────────────────────────────────────────────────────────
+
+def _many(src: Path, n: int = 6, w: int = 800, h: int = 600):
+    src.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        img = photo(w, h, seed=i)
+        if i % 2:
+            img = (img * 0.4).astype(np.uint8)
+        Image.fromarray(img).save(src / f"f{i}.jpg", quality=92)
+
+
+def test_parallel_auto_matches_serial(tmp_path):
+    _many(tmp_path / "src")
+    pm.run_enhance(tmp_path / "src", tmp_path / "s", "auto", workers=1)
+    pm.run_enhance(tmp_path / "src", tmp_path / "p", "auto", workers=3)
+    for f in sorted((tmp_path / "s").glob("*.jpg")):
+        assert f.read_bytes() == (tmp_path / "p" / f.name).read_bytes(), f.name
+    assert ((tmp_path / "s" / "mejora_reporte.csv").read_text()
+            == (tmp_path / "p" / "mejora_reporte.csv").read_text())
+
+
+def test_parallel_dedup_matches_serial(tmp_path, monkeypatch):
+    src = tmp_path / "src"
+    _many(src, n=5)
+    (src / "copia.jpg").write_bytes((src / "f0.jpg").read_bytes())
+    found = {}
+    for workers in (1, 3):
+        monkeypatch.setattr(pm, "MAX_WORKERS", workers)
+        monkeypatch.setattr(pm, "CACHE_PATH", tmp_path / f"cache{workers}.sqlite")
+        pm.run_dedup(src, tmp_path / f"out{workers}", no_convert=True, dry_run=True)
+        infos = [pm.get_image_info(p) for p in pm.find_images(src)]
+        found[workers] = sorted(len(g) for g in pm.group_duplicates(infos, 6))
+    assert found[1] == found[3]
+
+
+def test_parallel_blur_detect(tmp_path, monkeypatch):
+    monkeypatch.setattr(pm, "MAX_WORKERS", 3)
+    src = tmp_path / "src"
+    _many(src, n=5)
+    Image.new("RGB", (400, 300), (90, 90, 90)).save(src / "plana.jpg")
+    pm.run_blur_detect(src, threshold=100.0)
+    with open(tmp_path / "blur_reporte_src.csv", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 6
+    assert {r["estado"] for r in rows if r["archivo_original"].endswith("plana.jpg")} == {"BORROSA"}
+
+
+COUNTING_ESRGAN = FAKE_ESRGAN.replace(
+    "args = dict(", "open({counter!r}, 'a').write('x')\nargs = dict(")
+
+
+def test_realesrgan_runs_once_per_batch(tmp_path, monkeypatch):
+    counter = tmp_path / "calls.txt"
+    exe = tmp_path / "fake_esrgan"
+    exe.write_text(COUNTING_ESRGAN.replace("{counter!r}", repr(str(counter)))
+                   .format(python=sys.executable))
+    exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv(pm.REALESRGAN_ENV, str(exe))
+    src = tmp_path / "src"
+    _many(src, n=5, w=640, h=480)
+    pm.run_enhance(src, tmp_path / "out", "realesrgan", target="fullhd")
+    assert counter.read_text() == "x"            # 5 fotos, 1 sola ejecución
+    for i in range(5):
+        with Image.open(tmp_path / "out" / f"f{i}_FHD.jpg") as res:
+            assert res.size == (1440, 1080)
+
+
+def test_realesrgan_batch_reports_progress(tmp_path):
+    exe = _fake_esrgan_exe(tmp_path)
+    seen = []
+    ups = pm.realesrgan_batch([Image.fromarray(photo(64, 48))] * 2, exe, [2, 2],
+                              on_progress=lambda done, frac: seen.append((done, frac)))
+    assert [u.size for u in ups] == [(128, 96)] * 2
+    assert (0, 0.5) in seen and any(d >= 1 for d, _ in seen)
+
+
+def test_progress_non_tty_prints_by_deciles(capsys):
+    prog = pm.Progress(100, "Test", min_interval=0)
+    for i in range(100):
+        prog.update(i, "x.jpg")
+    prog.finish()
+    out = capsys.readouterr().out.strip().splitlines()
+    assert 5 <= len(out) <= 12
+    assert "100%" in out[-1]
+
+
+def test_realesrgan_falls_back_to_one_by_one(tmp_path):
+    """Si el programa no acepta carpetas, se reintenta foto por foto."""
+    exe = tmp_path / "file_only_esrgan"
+    exe.write_text(textwrap.dedent(f"""\
+        #!{sys.executable}
+        import sys
+        from pathlib import Path
+        from PIL import Image
+        a = dict(zip(sys.argv[1::2], sys.argv[2::2]))
+        if Path(a["-i"]).is_dir():
+            print("decode image failed", file=sys.stderr); sys.exit(1)
+        with Image.open(a["-i"]) as im:
+            im.resize((im.width * 4, im.height * 4)).save(a["-o"])
+    """))
+    exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
+    ups = pm.realesrgan_batch([Image.fromarray(photo(64, 48))] * 3, exe, [2, 2, 2])
+    assert [u.size for u in ups] == [(128, 96)] * 3

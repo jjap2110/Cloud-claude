@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Photo Manager CLI v1.9.0
+Photo Manager CLI v1.10.0
 Herramienta completa de gestión de fotos.
 
 Funcionalidades:
@@ -93,7 +93,7 @@ if _CV2:
 # CONSTANTES
 # ══════════════════════════════════════════════════
 
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 
 # [FIX #12] Separar formatos soportados por Pillow vs RAW
 PILLOW_EXTENSIONS = {
@@ -526,6 +526,19 @@ class HashCache:
             self.conn = None
 
 
+def _hash_task(args: tuple) -> dict:
+    """Trabajo de un proceso: hash + metadatos de una foto (no lanza excepciones)."""
+    path, hash_size = args
+    skips: dict = {}
+    try:
+        st = path.stat()
+    except OSError as e:
+        return {"path": path, "st": None, "info": None,
+                "skips": {"error": 1, "error_samples": [f"{path.name}: {e}"]}}
+    info = get_image_info(path, hash_size, skip_counts=skips)
+    return {"path": path, "st": st, "info": info, "skips": skips}
+
+
 def _sha256_file(filepath: Path) -> str:
     digest = hashlib.sha256()
     with open(filepath, "rb") as f:
@@ -657,6 +670,152 @@ def format_size(n_bytes: int) -> str:
         return f"{n_bytes / (1024 ** 3):.2f} GB"
     else:
         return f"{n_bytes / (1024 ** 4):.2f} TB"
+
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = int(max(seconds, 0))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+class Progress:
+    """Indicador de avance en una sola línea: barra, %, tiempo y estimación.
+
+    `sub` (0-1) permite mostrar el avance dentro de la foto actual, p. ej.
+    los porcentajes que va informando Real-ESRGAN. Si la salida no es una
+    terminal (redirigida a archivo), imprime solo cada 10 %.
+    """
+
+    def __init__(self, total: int, label: str = "", min_interval: float = 0.2):
+        self.total = max(total, 1)
+        self.label = label
+        self.min_interval = min_interval
+        self.t0 = time.time()
+        self._last = 0.0
+        self._last_decile = -1
+        self.tty = sys.stdout.isatty()
+
+    def update(self, done: int, current: str = "", sub: float | None = None,
+               force: bool = False):
+        now = time.time()
+        if not force and now - self._last < self.min_interval and done < self.total:
+            return
+        self._last = now
+        frac = (done + (sub or 0.0)) / self.total
+        frac = min(max(frac, 0.0), 1.0)
+        elapsed = now - self.t0
+        eta = elapsed / frac - elapsed if frac > 0.01 else None
+        width = 20
+        filled = int(frac * width)
+        bar = "█" * filled + "░" * (width - filled)
+        parts = [f"  {self.label} [{done}/{self.total}] {bar} {frac * 100:3.0f}%",
+                 _fmt_duration(elapsed)]
+        if eta is not None and done < self.total:
+            parts.append(f"quedan ~{_fmt_duration(eta)}")
+        line = " | ".join(parts)
+        if current:
+            line += f" | {current}"
+            if sub is not None and done < self.total:
+                line += f" {sub * 100:.0f}%"
+        if self.tty:
+            cols = shutil.get_terminal_size((100, 20)).columns
+            print("\r" + line[:cols - 1].ljust(cols - 1), end="", flush=True)
+        else:
+            decile = int(frac * 10)
+            if decile != self._last_decile or done >= self.total:
+                self._last_decile = decile
+                print(line, flush=True)
+
+    def finish(self, current: str = ""):
+        self.update(self.total, current, force=True)
+        if self.tty:
+            print()
+
+
+# ── Procesamiento en paralelo ─────────────────────
+
+MAX_WORKERS = max(1, min(4, os.cpu_count() or 1))
+PARALLEL_MIN_ITEMS = 4
+
+
+def _worker_init():
+    # Cada proceso usa 1 hilo de OpenCV: evita que 4 procesos × N hilos
+    # compitan por los mismos núcleos.
+    if _CV2:
+        try:
+            cv2.setNumThreads(1)
+        except Exception:
+            pass
+
+
+def parallel_map(fn, items: list, label: str, workers: int | None = None,
+                 describe=None):
+    """Aplica fn a cada elemento usando varios procesos, con indicador de avance.
+
+    Produce (índice, resultado) en orden de finalización. `fn` debe ser una
+    función de módulo que NO lance excepciones (que devuelva el error como
+    resultado). Si no se puede crear el pool de procesos, trabaja en serie.
+    """
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    workers = min(workers or MAX_WORKERS, max(len(items), 1))
+    if len(items) < PARALLEL_MIN_ITEMS:
+        workers = 1         # arrancar procesos cuesta más de lo que ahorra
+    describe = describe or (lambda item: "")
+    progress = Progress(len(items), label)
+
+    pool = None
+    if workers > 1:
+        try:
+            # "spawn": procesos nuevos. Con "fork" (defecto en Linux) un hijo
+            # puede heredar un candado tomado por un hilo de OpenCV y quedarse
+            # bloqueado para siempre.
+            pool = ProcessPoolExecutor(
+                max_workers=workers, initializer=_worker_init,
+                mp_context=multiprocessing.get_context("spawn"))
+        except (OSError, NotImplementedError, ImportError) as e:
+            print(f"  ⚠ Sin procesamiento paralelo ({e}); se sigue en serie.")
+
+    if pool is None:
+        for i, item in enumerate(items):
+            progress.update(i, describe(item), force=True)
+            yield i, fn(item)
+        progress.finish()
+        return
+
+    from concurrent.futures.process import BrokenProcessPool
+    finished: set[int] = set()
+    broken = None
+    with pool:
+        futures = {pool.submit(fn, item): i for i, item in enumerate(items)}
+        try:
+            for fut in as_completed(futures):
+                i = futures[fut]
+                result = fut.result()
+                finished.add(i)
+                progress.update(len(finished), describe(items[i]))
+                yield i, result
+        except BrokenProcessPool as e:
+            broken = e
+            for f in futures:
+                f.cancel()
+
+    if broken is not None:
+        # Un proceso murió (memoria insuficiente, entorno sin spawn...):
+        # terminar en serie solo lo que falta, sin repetir lo ya hecho.
+        print(f"\n  ⚠ Falló el procesamiento paralelo ({broken}); "
+              "se continúa en serie.")
+        for i, item in enumerate(items):
+            if i in finished:
+                continue
+            progress.update(len(finished), describe(item), force=True)
+            result = fn(item)
+            finished.add(i)
+            yield i, result
+    progress.finish()
 
 
 # ══════════════════════════════════════════════════
@@ -877,16 +1036,37 @@ def run_dedup(source: Path, output: Path, compare: Path | None = None,
     skip_counts = {"multipage": 0, "error": 0, "error_samples": []}
     cache = HashCache() if use_cache else None
     try:
-        for i, img in enumerate(images, 1):
-            if i % 50 == 0 or i == len(images):
-                print(f"    [{i}/{len(images)}]", end="\r")
-            info = get_image_info(img, hash_size, skip_counts=skip_counts,
-                                  cache=cache)
-            if info:
-                infos.append(info)
+        # 1) Caché (rápido, en el proceso principal)
+        pending = []
+        for img in images:
+            cached = None
+            if cache:
+                try:
+                    cached = cache.get(img, img.stat(), hash_size)
+                except OSError:
+                    cached = None
+            if cached == HashCache.MULTIPAGE:
+                skip_counts["multipage"] += 1
+            elif cached:
+                infos.append(cached)
+            else:
+                pending.append(img)
+        # 2) Lo que falta, en paralelo (decodificar + pHash + SHA-256)
+        tasks = [(img, hash_size) for img in pending]
+        for _, res in parallel_map(_hash_task, tasks, "Hash",
+                                   describe=lambda t: t[0].name):
+            for key in ("multipage", "error"):
+                skip_counts[key] += res["skips"].get(key, 0)
+            skip_counts["error_samples"] += res["skips"].get("error_samples", [])
+            if cache and res["st"] is not None and (res["info"] or res["skips"].get("multipage")):
+                cache.put(res["path"], res["st"], hash_size, res["info"],
+                          multipage=bool(res["skips"].get("multipage")))
+            if res["info"]:
+                infos.append(res["info"])
     finally:
         if cache:
             cache.close()
+    infos.sort(key=lambda x: str(x["path"]))   # orden estable para agrupar
     print(f"    {len(infos)} procesadas OK")
     if cache and cache.hits:
         print(f"    ⚡ {cache.hits} desde caché (sin re-decodificar)")
@@ -966,7 +1146,9 @@ def run_dedup(source: Path, output: Path, compare: Path | None = None,
 
         orig_total, conv_total = 0, 0
         heic_copied = alpha_copied = exception_copied = 0
+        progress = Progress(len(winners), "Guardando")
         for i, w in enumerate(winners, 1):
+            progress.update(i - 1, w['path'].name)
             src = w["path"]
             # [FIX #11] Paths relativos correctos para compare
             try:
@@ -1013,9 +1195,7 @@ def run_dedup(source: Path, output: Path, compare: Path | None = None,
             else:
                 print(f"  ⚠ Falló conversión: {src.name}")
 
-            if i % 20 == 0 or i == len(winners):
-                print(f"    [{i}/{len(winners)}] {i * 100 // len(winners)}%", end="\r")
-        print()
+        progress.finish()
         if converting and orig_total:
             print(f"    Original: {format_size(orig_total)} → HEIF: {format_size(conv_total)}"
                   f" ({(1 - conv_total / orig_total) * 100:.0f}% reducción)")
@@ -1318,40 +1498,134 @@ def target_size(width: int, height: int, scale: float) -> tuple[int, int]:
     return max(1, round(width * scale)), max(1, round(height * scale))
 
 
-def realesrgan_upscale(img: Image.Image, exe: Path, out_scale: float = 2,
-                       timeout: int = 1800) -> Image.Image:
-    """Super-resolución con Real-ESRGAN (x4plus) y ajuste LANCZOS a ×out_scale.
+REALESRGAN_TIMEOUT_PER_IMAGE = 1800   # s; protección ante un bloqueo de la GPU
+REALESRGAN_CHUNK = 8                  # fotos por ejecución del programa
+REALESRGAN_CHUNK_MPX = 400            # límite de megapíxeles de salida por lote
+_PCT_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*%")
 
-    El modelo x4plus siempre amplía ×4; luego se reduce al tamaño pedido.
-    Reducir desde ×4 da mejor resultado que un modelo ×2 débil.
+
+def _realesrgan_cmd(exe: Path, src: Path, dst: Path) -> list[str]:
+    cmd = [str(exe), "-i", str(src), "-o", str(dst),
+           "-n", REALESRGAN_MODEL, "-s", "4", "-f", "png"]
+    models = exe.parent / "models"
+    if models.is_dir():
+        cmd += ["-m", str(models)]
+    return cmd
+
+
+def realesrgan_batch(images: list[Image.Image], exe: Path, scales: list[float],
+                     on_progress=None) -> list:
+    """Amplía varias imágenes; si el lote completo falla, reintenta una a una.
+
+    El reintento cubre versiones del programa que no acepten carpetas o
+    errores puntuales con un archivo concreto.
     """
-    out_scale = min(float(out_scale), REALESRGAN_MAX_SCALE)
+    results = _realesrgan_run(images, exe, scales, on_progress, as_dir=True)
+    if len(images) > 1 and all(isinstance(r, Exception) for r in results):
+        results = []
+        for i, (img, scale) in enumerate(zip(images, scales)):
+            cb = (lambda done, frac, base=i: on_progress(base + done, frac)) if on_progress else None
+            results += _realesrgan_run([img], exe, [scale], cb, as_dir=False)
+    return results
+
+
+def _realesrgan_run(images: list[Image.Image], exe: Path, scales: list[float],
+                    on_progress=None, as_dir: bool = True) -> list:
+    """Amplía varias imágenes en UNA ejecución de Real-ESRGAN.
+
+    El modelo y la GPU se inicializan una sola vez por lote, en vez de una
+    vez por foto. on_progress(terminadas, fracción_de_la_actual|None) se
+    llama a medida que el programa informa porcentajes.
+    Devuelve, por imagen, la imagen ampliada (PIL) o la excepción.
+    """
+    import threading
+    from collections import deque
+
+    results: list = [None] * len(images)
     with tempfile.TemporaryDirectory(prefix="pm_esrgan_") as tmp:
-        src = Path(tmp) / "in.png"
-        dst = Path(tmp) / "out.png"
-        img.save(src)
-        cmd = [str(exe), "-i", str(src), "-o", str(dst),
-               "-n", REALESRGAN_MODEL, "-s", "4", "-f", "png"]
-        models = exe.parent / "models"
-        if models.is_dir():
-            cmd += ["-m", str(models)]
+        in_dir, out_dir = Path(tmp) / "in", Path(tmp) / "out"
+        in_dir.mkdir()
+        out_dir.mkdir()
+        names = []
+        for i, img in enumerate(images):
+            name = f"{i:05d}.png"
+            img.save(in_dir / name, compress_level=1)   # temporal: rápido
+            names.append(name)
+
+        if as_dir:
+            cmd = _realesrgan_cmd(exe, in_dir, out_dir)
+        else:
+            cmd = _realesrgan_cmd(exe, in_dir / names[0], out_dir / names[0])
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True,
-                                 timeout=timeout)
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"Real-ESRGAN superó {timeout}s")
-        # El binario a veces sale con código 0 aunque falle Vulkan: comprobar salida
-        if res.returncode != 0 or not dst.exists():
-            detail = (res.stderr or res.stdout or "").strip().splitlines()
-            raise RuntimeError("Real-ESRGAN falló"
-                               + (f": {detail[-1]}" if detail else
-                                  f" (código {res.returncode}, sin salida)"))
-        with Image.open(dst) as up:
-            up = up.convert("RGB")
-            target = target_size(img.width, img.height, out_scale)
-            if up.size != target:
-                up = up.resize(target, Image.Resampling.LANCZOS)
-            return up
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                text=True, errors="replace")
+        except OSError as e:
+            err = RuntimeError(f"No se pudo ejecutar Real-ESRGAN: {e}")
+            return [err] * len(images)
+
+        timer = threading.Timer(REALESRGAN_TIMEOUT_PER_IMAGE * len(images), proc.kill)
+        timer.start()
+        last_lines = deque(maxlen=5)
+        try:
+            for line in proc.stderr:
+                line = line.strip()
+                if not line:
+                    continue
+                last_lines.append(line)
+                if on_progress:
+                    m = _PCT_RE.search(line)
+                    frac = float(m.group(1).replace(",", ".")) / 100 if m else None
+                    finished = sum(1 for n in names if (out_dir / n).exists())
+                    on_progress(finished, frac)
+            proc.wait()
+        finally:
+            timer.cancel()
+
+        detail = next((ln for ln in reversed(last_lines) if not _PCT_RE.fullmatch(ln)), "")
+        for i, (img, name, scale) in enumerate(zip(images, names, scales)):
+            out = out_dir / name
+            if not out.exists():
+                # El binario a veces sale con código 0 aunque falle Vulkan
+                results[i] = RuntimeError(
+                    "Real-ESRGAN falló" + (f": {detail}" if detail
+                                           else f" (código {proc.returncode}, sin salida)"))
+                continue
+            try:
+                with Image.open(out) as up:
+                    up = up.convert("RGB")
+                size = target_size(img.width, img.height,
+                                   min(float(scale), REALESRGAN_MAX_SCALE))
+                if up.size != size:
+                    up = up.resize(size, Image.Resampling.LANCZOS)
+                results[i] = up
+            except Exception as e:
+                results[i] = e
+    return results
+
+
+def realesrgan_upscale(img: Image.Image, exe: Path, out_scale: float = 2) -> Image.Image:
+    """Super-resolución de una sola imagen (Real-ESRGAN x4plus + LANCZOS)."""
+    result = realesrgan_batch([img], exe, [out_scale])[0]
+    if isinstance(result, Exception):
+        raise result if isinstance(result, RuntimeError) else RuntimeError(str(result))
+    return result
+
+
+def _esrgan_chunks(items: list, sizes: list[tuple[int, int]]):
+    """Agrupa en lotes de hasta REALESRGAN_CHUNK fotos y REALESRGAN_CHUNK_MPX
+    megapíxeles de salida (×4), para no llenar el disco con temporales."""
+    chunk, mpx = [], 0.0
+    for item, (w, h) in zip(items, sizes):
+        out_mpx = w * h * 16 / 1e6
+        if chunk and (len(chunk) >= REALESRGAN_CHUNK or mpx + out_mpx > REALESRGAN_CHUNK_MPX):
+            yield chunk
+            chunk, mpx = [], 0.0
+        chunk.append(item)
+        mpx += out_mpx
+    if chunk:
+        yield chunk
 
 
 # ── Modo automático adaptativo ────────────────────
@@ -1393,10 +1667,19 @@ def estimate_noise(gray) -> float:
 
 def analyze_image(bgr) -> dict:
     """Mide lo que la foto necesita: resolución, ruido, exposición,
-    rango tonal, dominante de color y nitidez."""
+    rango tonal, dominante de color y nitidez.
+
+    Tono, color y nitidez se miden sobre una copia de BLUR_MAX_SIDE px
+    (las estadísticas apenas cambian y es ~10× más rápido en 12 MP); el
+    ruido se mide a resolución completa porque al reducir desaparece.
+    """
     h, w = bgr.shape[:2]
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    small_bgr = bgr
+    if max(h, w) > BLUR_MAX_SIDE:
+        f = BLUR_MAX_SIDE / max(h, w)
+        small_bgr = cv2.resize(bgr, (max(1, round(w * f)), max(1, round(h * f))),
+                               interpolation=cv2.INTER_AREA)
+    lab = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2LAB)
     lum = lab[:, :, 0]
     p_lo, p_hi = (float(v) for v in np.percentile(lum, (0.5, 99.5)))
 
@@ -1415,16 +1698,12 @@ def analyze_image(bgr) -> dict:
     else:
         da = db = 0.0          # sin suficientes neutros: no se puede saber
 
-    small = gray
-    if max(h, w) > BLUR_MAX_SIDE:
-        f = BLUR_MAX_SIDE / max(h, w)
-        small = cv2.resize(gray, (max(1, round(w * f)), max(1, round(h * f))),
-                           interpolation=cv2.INTER_AREA)
+    small = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY)
 
     return {
         "width": w, "height": h,
         "low_res": max(w, h) < AUTO_LOWRES_SIDE,
-        "noise": estimate_noise(gray),
+        "noise": estimate_noise(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)),
         "mean": float(lum.mean()),
         "p_lo": p_lo, "p_hi": p_hi, "range": p_hi - p_lo,
         "da": da, "db": db, "cast": math.hypot(da, db),
@@ -1472,7 +1751,8 @@ def _gamma_toward(bgr, mean: float, target: float = 118.0, amount: float = 0.6):
 
 
 def enhance_adaptive(bgr, esrgan: Path | None = None, dry_run: bool = False,
-                     target: str = DEFAULT_TARGET):
+                     target: str = DEFAULT_TARGET, analysis: dict | None = None,
+                     upscaled=None):
     """Analiza la foto y aplica solo las correcciones que necesita.
 
     Retorna (imagen BGR, análisis, lista de acciones legibles).
@@ -1481,20 +1761,25 @@ def enhance_adaptive(bgr, esrgan: Path | None = None, dry_run: bool = False,
     resolución y reducción de ruido); sirve para el modo diagnóstico.
     `target` (clave de UPSCALE_TARGETS) fija la resolución final: solo se
     amplía si la foto no la alcanza por al menos AUTO_MIN_UPSCALE.
+    `analysis`: análisis ya calculado (evita repetirlo).
+    `upscaled`: imagen BGR ya ampliada por un lote de Real-ESRGAN; si se
+    pasa, se usa en lugar de llamar al programa.
     """
-    a = analyze_image(bgr)
+    a = analysis or analyze_image(bgr)
     actions = []
 
     needed = upscale_factor(a["width"], a["height"], target)
     a["upscale_needed"] = needed
     a["needs_upscale"] = needed >= AUTO_MIN_UPSCALE
 
-    upscaled = False
-    if a["needs_upscale"] and esrgan:
+    pre_upscaled, upscaled = upscaled, False
+    if a["needs_upscale"] and (esrgan or pre_upscaled is not None):
         # Real-ESRGAN además limpia ruido y artefactos JPEG
         scale = min(needed, REALESRGAN_MAX_SCALE)
         new_w, new_h = target_size(a["width"], a["height"], scale)
-        if not dry_run:
+        if pre_upscaled is not None:
+            bgr = pre_upscaled
+        elif not dry_run:
             bgr = _pil_to_bgr(realesrgan_upscale(_bgr_to_pil(bgr), esrgan, scale))
         capped = " (limitado a ×4)" if needed > REALESRGAN_MAX_SCALE else ""
         actions.append(f"super-resolución ×{scale:.2g} ({a['width']}x{a['height']} → "
@@ -1556,8 +1841,60 @@ ENHANCE_FILTERS = {
 }
 
 
+def _oriented_size(path: Path) -> tuple[int, int]:
+    """Tamaño tal como se ve la foto (orientación EXIF aplicada), sin decodificar."""
+    with Image.open(path) as img:
+        w, h = img.size
+        try:
+            if img.getexif().get(TAG_ORIENTATION) in (5, 6, 7, 8):
+                w, h = h, w
+        except Exception:
+            pass
+    return w, h
+
+
+def _enhance_task(job: dict) -> dict:
+    """Procesa una foto en un proceso aparte (CPU). Nunca lanza excepciones.
+
+    status: ok | copied | esrgan (necesita ampliación: la hace el proceso
+    principal en la fase de GPU) | error
+    """
+    src, dst, mode = job["src"], job["dst"], job["mode"]
+    res = {"src": src, "status": "ok", "row": None, "analysis": None,
+           "actions": [], "meta_ok": True, "error": None}
+    try:
+        arr = _pil_to_bgr(_load_oriented_rgb(src))
+        if mode in ("auto", "diagnose"):
+            analysis = analyze_image(arr)
+            needed = upscale_factor(analysis["width"], analysis["height"], job["target"])
+            if mode == "auto" and job["esrgan"] and needed >= AUTO_MIN_UPSCALE:
+                res.update(status="esrgan", analysis=analysis)
+                return res
+            arr, analysis, actions = enhance_adaptive(
+                arr, job["esrgan"], dry_run=(mode == "diagnose"),
+                target=job["target"], analysis=analysis)
+            res.update(analysis=analysis, actions=actions,
+                       row=_auto_report_row(src, analysis, actions))
+            if mode == "diagnose":
+                return res
+            if not actions:
+                # Nada que corregir: copia exacta, sin re-comprimir
+                shutil.copy2(str(src), str(dst))
+                res["status"] = "copied"
+                return res
+        else:
+            arr = ENHANCE_FILTERS[mode](arr)
+        written, meta_ok = _save_pil(_bgr_to_pil(arr), dst, src)
+        if not written:
+            raise OSError(f"no se pudo escribir {dst.name}")
+        res["meta_ok"] = meta_ok
+    except Exception as e:
+        res.update(status="error", error=f"{src.name}: {e}")
+    return res
+
+
 def run_enhance(source: Path, output: Path, mode: str,
-                target: str = DEFAULT_TARGET):
+                target: str = DEFAULT_TARGET, workers: int | None = None):
     """Ejecuta mejora de fotos.
 
     Modos: auto, diagnose, clahe, denoise, gamma, sharpen (OpenCV);
@@ -1565,6 +1902,9 @@ def run_enhance(source: Path, output: Path, mode: str,
     realesrgan (binario externo realesrgan-ncnn-vulkan).
     `target` (clave de UPSCALE_TARGETS): resolución final para Real-ESRGAN,
     tanto en el modo realesrgan como en auto.
+
+    Dos fases: 1) CPU en paralelo (análisis, ajustes, guardado);
+    2) GPU, en serie y por lotes, para las fotos que Real-ESRGAN debe ampliar.
     """
     if target not in UPSCALE_TARGETS:
         print(f"  ✗ Resolución desconocida: {target}")
@@ -1600,8 +1940,7 @@ def run_enhance(source: Path, output: Path, mode: str,
             return
         sr = _make_superres(model_name, model_path)
     elif mode in ("auto", "diagnose"):
-        esrgan = None
-        auto_esrgan = find_realesrgan()   # opcional: solo para baja resolución
+        esrgan = find_realesrgan()   # opcional: solo para lo que no llega al objetivo
     elif mode not in ENHANCE_FILTERS:
         print(f"  ✗ Modo desconocido: {mode}")
         return
@@ -1615,97 +1954,163 @@ def run_enhance(source: Path, output: Path, mode: str,
     adaptive = mode in ("auto", "diagnose")
     diagnose_only = mode == "diagnose"
     verb = "a analizar" if diagnose_only else "a procesar"
-    print(f"  {len(images)} imágenes {verb}\n")
-    if esrgan or (adaptive and auto_esrgan):
-        print(f"  Resolución final: {UPSCALE_TARGETS[target]['label']}\n")
+    print(f"  {len(images)} imágenes {verb}")
+    if esrgan:
+        print(f"  Resolución final: {UPSCALE_TARGETS[target]['label']}")
+    print()
     suffix = "_x2" if sr is not None else UPSCALE_TARGETS[target]["suffix"]
 
-    ok, errors, metadata_warnings = 0, 0, 0
-    report_rows = []
-    action_counts = defaultdict(int)
-    lowres_without_esrgan = 0
-    already_big = 0
-    t0 = time.time()
-
-    for i, img_path in enumerate(images, 1):
+    # Destinos (calculados en el proceso principal: sin carreras de nombres)
+    jobs = []
+    for img_path in images:
         try:
             rel = img_path.relative_to(source)
         except ValueError:
             rel = Path(img_path.name)
-        plain_dst = output / rel
-        dst = plain_dst
-        if sr is not None or esrgan is not None:
-            dst = dst.with_stem(dst.stem + suffix)
+        plain = output / rel
+        upscale_mode = mode == "realesrgan" or sr is not None
+        dst = plain.with_stem(plain.stem + suffix) if upscale_mode else plain
         dst.parent.mkdir(parents=True, exist_ok=True)
-        dst = _unique_path(dst)
-        if dst.resolve() == img_path.resolve():
-            print(f"  ✗ Ruta de salida coincide con el original: {img_path}")
+        jobs.append({"src": img_path, "dst": _unique_path(dst), "plain": plain,
+                     "mode": mode, "target": target, "esrgan": esrgan})
+
+    ok = errors = metadata_warnings = already_big = lowres_without_esrgan = 0
+    report_rows, error_msgs = [], []
+    action_counts = defaultdict(int)
+    esrgan_jobs = []        # (job, análisis | None)
+    t0 = time.time()
+
+    def record(res):
+        nonlocal ok, errors, metadata_warnings, lowres_without_esrgan
+        if res["status"] == "error":
             errors += 1
-            continue
+            error_msgs.append(res["error"])
+            return
+        ok += 1
+        if not res["meta_ok"]:
+            metadata_warnings += 1
+        if res["row"]:
+            report_rows.append(res["row"])
+            a = res["analysis"]
+            if a and a.get("needs_upscale") and not esrgan:
+                lowres_without_esrgan += 1
+            for act in res["actions"]:
+                action_counts[act.split(" (")[0].split(" ×")[0]] += 1
 
-        try:
-            pil = _load_oriented_rgb(img_path)
-            if adaptive:
-                arr = _pil_to_bgr(pil)
-                arr, analysis, actions = enhance_adaptive(
-                    arr, auto_esrgan, dry_run=diagnose_only, target=target)
-                if analysis["needs_upscale"] and not auto_esrgan:
-                    lowres_without_esrgan += 1
-                for act in actions:
-                    action_counts[act.split(" (")[0].split(" ×")[0]] += 1
-                report_rows.append(_auto_report_row(img_path, analysis, actions))
-                if diagnose_only:
-                    ok += 1
-                    continue
-                if not actions:
-                    # Nada que corregir: copia exacta, sin re-comprimir
-                    shutil.copy2(str(img_path), str(dst))
-                    ok += 1
-                    continue
-                result = _bgr_to_pil(arr)
-            elif esrgan:
-                scale = upscale_factor(pil.width, pil.height, target)
-                if scale <= 1.0:
-                    # Ya alcanza la resolución pedida: copia exacta, sin ampliar
-                    shutil.copy2(str(img_path), str(_unique_path(plain_dst)))
-                    already_big += 1
-                    ok += 1
-                    continue
-                result = realesrgan_upscale(pil, esrgan, scale)
-            else:
-                arr = _pil_to_bgr(pil)
-                if sr is not None:
-                    h, w = arr.shape[:2]
-                    if h < 8 or w < 8:
-                        raise ValueError(f"demasiado pequeña para superres ({w}x{h})")
-                    arr = sr.upsample(arr)
-                else:
-                    arr = ENHANCE_FILTERS[mode](arr)
-                result = _bgr_to_pil(arr)
-
-            written, meta_ok = _save_pil(result, dst, img_path)
-            if not written:
-                print(f"  ⚠ No se pudo escribir: {dst.name}")
-                errors += 1
+    # ── Fase 1: CPU ────────────────────────────────
+    if mode == "realesrgan":
+        for job in jobs:
+            try:
+                w, h = _oriented_size(job["src"])
+            except Exception as e:
+                record({"status": "error", "error": f"{job['src'].name}: {e}"})
                 continue
-            if not meta_ok:
-                metadata_warnings += 1
-            ok += 1
-        except Exception as e:
-            print(f"  ⚠ {img_path.name}: {e}")
-            errors += 1
+            if upscale_factor(w, h, target) <= 1.0:
+                # Ya alcanza la resolución pedida: copia exacta, sin ampliar
+                shutil.copy2(str(job["src"]), str(_unique_path(job["plain"])))
+                already_big += 1
+                ok += 1
+            else:
+                esrgan_jobs.append((job, None))
+    elif sr is not None:
+        progress = Progress(len(jobs), "Super-resolución")
+        for i, job in enumerate(jobs):
+            progress.update(i, job["src"].name, force=True)
+            try:
+                arr = _pil_to_bgr(_load_oriented_rgb(job["src"]))
+                h, w = arr.shape[:2]
+                if h < 8 or w < 8:
+                    raise ValueError(f"demasiado pequeña para superres ({w}x{h})")
+                written, meta_ok = _save_pil(_bgr_to_pil(sr.upsample(arr)),
+                                             job["dst"], job["src"])
+                if not written:
+                    raise OSError(f"no se pudo escribir {job['dst'].name}")
+                record({"status": "ok", "meta_ok": meta_ok, "row": None})
+            except Exception as e:
+                record({"status": "error", "error": f"{job['src'].name}: {e}"})
+        progress.finish()
+    else:
+        label = "Analizando" if diagnose_only else "Procesando"
+        for i, res in parallel_map(_enhance_task, jobs, label, workers=workers,
+                                   describe=lambda j: j["src"].name):
+            if res["status"] == "esrgan":
+                esrgan_jobs.append((jobs[i], res["analysis"]))
+            else:
+                record(res)
 
-        if i % 10 == 0 or i == len(images):
-            print(f"    [{i}/{len(images)}] {i * 100 // len(images)}%", end="\r")
+    # ── Fase 2: GPU (Real-ESRGAN por lotes) ─────────
+    if esrgan_jobs:
+        print(f"\n  Real-ESRGAN: {len(esrgan_jobs)} foto(s) a ampliar")
+        progress = Progress(len(esrgan_jobs), "Real-ESRGAN")
+        sizes = []
+        for job, analysis in esrgan_jobs:
+            if analysis:
+                sizes.append((analysis["width"], analysis["height"]))
+            else:
+                try:
+                    sizes.append(_oriented_size(job["src"]))
+                except Exception:
+                    sizes.append((1, 1))
+        done_before = 0
+        for chunk in _esrgan_chunks(esrgan_jobs, sizes):
+            loaded, scales, valid = [], [], []
+            for job, analysis in chunk:
+                try:
+                    img = _load_oriented_rgb(job["src"])
+                except Exception as e:
+                    record({"status": "error", "error": f"{job['src'].name}: {e}"})
+                    continue
+                loaded.append(img)
+                scales.append(upscale_factor(img.width, img.height, target))
+                valid.append((job, analysis))
 
+            def on_progress(finished, frac, base=done_before, chunk_jobs=valid):
+                current = chunk_jobs[min(finished, len(chunk_jobs) - 1)][0]["src"].name
+                progress.update(base + finished, current, sub=frac)
+
+            if valid:
+                progress.update(done_before, valid[0][0]["src"].name, force=True)
+                ups = realesrgan_batch(loaded, esrgan, scales, on_progress)
+            else:
+                ups = []
+            for (job, analysis), img, up in zip(valid, loaded, ups):
+                res = {"src": job["src"], "status": "ok", "row": None,
+                       "analysis": None, "actions": [], "meta_ok": True}
+                try:
+                    if isinstance(up, Exception):
+                        raise up
+                    if analysis is not None:          # modo auto: resto de ajustes
+                        arr, analysis, actions = enhance_adaptive(
+                            _pil_to_bgr(img), esrgan, target=target,
+                            analysis=analysis, upscaled=_pil_to_bgr(up))
+                        up = _bgr_to_pil(arr)
+                        res.update(analysis=analysis, actions=actions,
+                                   row=_auto_report_row(job["src"], analysis, actions))
+                    written, meta_ok = _save_pil(up, job["dst"], job["src"])
+                    if not written:
+                        raise OSError(f"no se pudo escribir {job['dst'].name}")
+                    res["meta_ok"] = meta_ok
+                except Exception as e:
+                    res.update(status="error", error=f"{job['src'].name}: {e}")
+                record(res)
+            done_before += len(chunk)
+            progress.update(done_before, force=True)
+        progress.finish()
+
+    # ── Resumen ──────────────────────────────────────
     elapsed = time.time() - t0
     done = "analizadas" if diagnose_only else "mejoradas"
-    print(f"\n\n  ✓ {ok} {done} | {errors} errores | {elapsed:.1f}s")
+    print(f"\n  ✓ {ok} {done} | {errors} errores | {_fmt_duration(elapsed)}")
+    for msg in error_msgs[:10]:
+        print(f"    ⚠ {msg}")
+    if len(error_msgs) > 10:
+        print(f"    ... y {len(error_msgs) - 10} errores más")
     if already_big:
         print(f"  ℹ {already_big} foto(s) ya tenían {UPSCALE_TARGETS[target]['label']} "
               "o más: copiadas sin cambios")
 
     if adaptive and report_rows:
+        report_rows.sort(key=lambda r: r["archivo"])
         untouched = sum(1 for r in report_rows if r["acciones"].startswith("ninguna"))
         print("\n  Diagnóstico:" if diagnose_only else "\n  Correcciones aplicadas:")
         for name, count in sorted(action_counts.items(), key=lambda x: -x[1]):
@@ -1751,7 +2156,9 @@ def run_organize(source: Path, output: Path, move: bool = False):
     organized = 0
     no_date = 0
 
+    progress = Progress(len(images), "Organizando")
     for i, img_path in enumerate(images, 1):
+        progress.update(i - 1, img_path.name)
         date = get_photo_date(img_path)
         if date:
             # [FIX #22] Validar año razonable
@@ -1784,11 +2191,10 @@ def run_organize(source: Path, output: Path, move: bool = False):
         except Exception as e:
             print(f"  ⚠ {img_path.name}: {e}")
 
-        if i % 50 == 0 or i == len(images):
-            print(f"    [{i}/{len(images)}]", end="\r")
 
+    progress.finish()
     action = "movidas" if move else "copiadas"
-    print(f"\n\n  ✓ {organized} fotos {action}")
+    print(f"\n  ✓ {organized} fotos {action}")
     if no_date:
         print(f"  ℹ {no_date} sin fecha válida → Sin_fecha/")
     print(f"  ✓ Resultado en: {output}")
@@ -1869,8 +2275,9 @@ def run_blur_detect(source: Path, threshold: float = 100.0,
     # [v1.3 H4] Rastrear archivos no analizables (score=None)
     skipped = []
 
-    for i, img_path in enumerate(images, 1):
-        score = blur_score(img_path)
+    for i, score in parallel_map(blur_score, images, "Analizando",
+                                 describe=lambda p: p.name):
+        img_path = images[i]
         if score is None:
             skipped.append(img_path)
         elif score < threshold:
@@ -1878,11 +2285,10 @@ def run_blur_detect(source: Path, threshold: float = 100.0,
         else:
             sharp.append((img_path, score))
 
-        if i % 30 == 0 or i == len(images):
-            print(f"    [{i}/{len(images)}]", end="\r")
-
     blurry.sort(key=lambda x: x[1])
-    print(f"\n\n  Nítidas: {len(sharp)} | Borrosas: {len(blurry)}", end="")
+    sharp.sort(key=lambda x: str(x[0]))
+    skipped.sort()
+    print(f"\n  Nítidas: {len(sharp)} | Borrosas: {len(blurry)}", end="")
     if skipped:
         print(f" | No analizadas: {len(skipped)}")
     else:
@@ -1975,7 +2381,9 @@ def run_compress(source: Path, output: Path, fmt: str = "heif",
     ext_map = {"heif": ".heif", "webp": ".webp", "jpeg": ".jpg"}
     target_ext = ext_map.get(fmt, ".jpg")
 
+    progress = Progress(len(images), "Convirtiendo")
     for i, img_path in enumerate(images, 1):
+        progress.update(i - 1, img_path.name)
         if keep_structure:
             try:
                 rel = img_path.relative_to(source)
@@ -2038,10 +2446,9 @@ def run_compress(source: Path, output: Path, fmt: str = "heif",
             print(f"  ⚠ {img_path.name}: {e}")
             errors += 1
 
-        if i % 20 == 0 or i == len(images):
-            print(f"    [{i}/{len(images)}] {i * 100 // len(images)}%", end="\r")
 
-    print(f"\n\n  Original:  {format_size(orig_total)}")
+    progress.finish()
+    print(f"\n  Original:  {format_size(orig_total)}")
     print(f"  {fmt.upper()}:     {format_size(conv_total)}")
     if orig_total:
         print(f"  Reducción: {(1 - conv_total / orig_total) * 100:.0f}%")
@@ -2079,7 +2486,9 @@ def run_stats(source: Path):
     readable_count = 0
     unreadable = []
 
+    progress = Progress(len(images), "Leyendo")
     for i, img_path in enumerate(images, 1):
+        progress.update(i - 1, img_path.name)
         # 1) stat: puede fallar por permisos / archivo borrado
         try:
             size = img_path.stat().st_size
@@ -2120,8 +2529,8 @@ def run_stats(source: Path):
             # pero no podemos bucketizar. Lo dejamos fuera de resolución/fecha.
             pass
 
-        if i % 100 == 0 or i == len(images):
-            print(f"    [{i}/{len(images)}]", end="\r")
+
+    progress.finish()
 
     raw_total_size = 0
     for rp in raw_files:
