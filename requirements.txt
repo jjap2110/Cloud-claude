@@ -2,6 +2,7 @@ Pillow>=10.0
 imagehash>=4.3
 numpy>=1.24
 pillow-heif>=0.16
-opencv-contrib-python==4.10.0.84
+# Opcional: detección de fotos borrosas más precisa
+# opencv-python-headless
 # Desarrollo / tests
 pytest>=8.0

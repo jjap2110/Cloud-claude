@@ -157,31 +157,33 @@ def _icc_bytes() -> bytes:
     return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
 
 
-def test_enhance_encodes_once_and_keeps_metadata(tmp_path):
+def test_enhance_encodes_once_and_keeps_metadata(tmp_path, monkeypatch):
     """v1.6.4 re-guardaba con Pillow a calidad 75 por defecto."""
+    monkeypatch.setenv(pm.REALESRGAN_ENV, str(_fake_esrgan_exe(tmp_path)))
     src, out = tmp_path / "src", tmp_path / "out"
     src.mkdir()
     icc = _icc_bytes()
     scene().save(src / "a.jpg", quality=95, icc_profile=icc,
                  exif=exif_bytes(original="2019:05:05 12:00:00"))
 
-    pm.run_enhance(src, out, "hdr")
+    pm.run_enhance(src, out, target="x2")
 
-    with Image.open(out / "a.jpg") as res:
+    with Image.open(out / "a_x2.jpg") as res:
         # Tabla de cuantización de luminancia: q95 → primer coef. 2; q75 → 8
         assert res.quantization[0][0] <= 3
         assert res.info.get("icc_profile") == icc
         assert res.getexif().get_ifd(EXIF_IFD).get(36867) == "2019:05:05 12:00:00"
 
 
-def test_enhance_applies_orientation_once(tmp_path):
+def test_enhance_applies_orientation_once(tmp_path, monkeypatch):
+    monkeypatch.setenv(pm.REALESRGAN_ENV, str(_fake_esrgan_exe(tmp_path)))
     src, out = tmp_path / "src", tmp_path / "out"
     src.mkdir()
     # 320x240 almacenada, orientación 6 (rotar 90°) → se ve 240x320
     scene().save(src / "r.jpg", quality=95, exif=exif_bytes(orientation=6))
-    pm.run_enhance(src, out, "hdr")
-    with Image.open(out / "r.jpg") as res:
-        assert res.size == (240, 320)
+    pm.run_enhance(src, out, target="x2")
+    with Image.open(out / "r_x2.jpg") as res:
+        assert res.size == (480, 640)
         assert res.getexif().get(274) in (None, 1)
 
 
@@ -312,7 +314,7 @@ def test_realesrgan_integration_with_fake_binary(tmp_path, monkeypatch):
     scene().save(src / "a.jpg", quality=95,
                  exif=exif_bytes(original="2019:05:05 12:00:00"))
 
-    pm.run_enhance(src, out, "realesrgan", target="x2")
+    pm.run_enhance(src, out, target="x2")
 
     with Image.open(out / "a_x2.jpg") as res:
         assert res.size == (640, 480)
@@ -355,7 +357,7 @@ def test_ask_folder_accepts_quoted_dragged_path(tmp_path, monkeypatch):
 
 
 # ──────────────────────────────────────────────────────────────
-# Modo automático adaptativo
+# Imagen sintética nítida (usada por varios tests)
 # ──────────────────────────────────────────────────────────────
 
 def photo(w=2000, h=1500, gray_share=0.4, base=None, seed=0):
@@ -370,101 +372,6 @@ def photo(w=2000, h=1500, gray_share=0.4, base=None, seed=0):
     img[color] = hue[color]
     small = np.clip(img, 0, 255).astype(np.uint8)
     return np.asarray(Image.fromarray(small).resize((w, h), Image.Resampling.NEAREST))
-
-
-def kinds(actions):
-    return {a.split(" (")[0] for a in actions}
-
-
-def test_auto_leaves_good_photo_untouched():
-    g = photo()
-    out, _, actions = pm.enhance_adaptive(g)
-    assert actions == []
-    assert np.array_equal(out, g)
-
-
-@pytest.mark.parametrize("name, base", [
-    ("bosque", [40, 150, 50]),
-    ("atardecer", [30, 110, 240]),
-])
-def test_auto_does_not_neutralize_intentional_colors(name, base):
-    img = photo(gray_share=0.15, base=base)
-    _, _, actions = pm.enhance_adaptive(img)
-    assert "corregir dominante de color" not in kinds(actions), name
-
-
-def test_auto_corrects_real_color_cast():
-    img = np.clip(photo().astype(int) + [-12, 0, 22], 0, 255).astype(np.uint8)
-    out, before, actions = pm.enhance_adaptive(img)
-    assert "corregir dominante de color" in kinds(actions)
-    assert pm.analyze_image(out)["cast"] < before["cast"] / 2
-
-
-def test_auto_reduces_noise_only_when_noisy():
-    rng = np.random.default_rng(1)
-    g = photo()
-    noisy = np.clip(g + rng.normal(0, 12, g.shape), 0, 255).astype(np.uint8)
-    out, before, actions = pm.enhance_adaptive(noisy)
-    assert "reducir ruido" in kinds(actions)
-    assert pm.analyze_image(out)["noise"] < before["noise"] / 2
-
-
-def test_auto_fixes_dark_and_flat():
-    g = photo()
-    for img in ((g * 0.35).astype(np.uint8), (g * 0.5 + 64).astype(np.uint8)):
-        out, before, actions = pm.enhance_adaptive(img)
-        after = pm.analyze_image(out)
-        assert "ampliar rango tonal" in kinds(actions)
-        assert after["range"] > before["range"] * 1.4
-        assert 90 <= after["mean"] <= 185
-
-
-def test_auto_sharpens_soft_photo():
-    import cv2
-    soft = cv2.GaussianBlur(photo(), (0, 0), 3)
-    out, before, actions = pm.enhance_adaptive(soft)
-    assert "enfocar" in kinds(actions)
-    assert pm.analyze_image(out)["sharpness"] > before["sharpness"]
-
-
-def test_auto_upscales_low_res_with_esrgan(tmp_path):
-    exe = tmp_path / "realesrgan-ncnn-vulkan"
-    exe.write_text(FAKE_ESRGAN.format(python=sys.executable))
-    exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
-    small = photo(800, 600)
-    out, _, actions = pm.enhance_adaptive(small, esrgan=exe, target="fullhd")
-    assert any(a.startswith("super-resolución") for a in actions)
-    assert out.shape[:2] == (1080, 1440)      # cabe en 1920×1080
-
-
-def test_diagnose_mode_writes_report_and_no_images(tmp_path):
-    src, out = tmp_path / "src", tmp_path / "out"
-    src.mkdir()
-    Image.fromarray(photo()[:, :, ::-1]).save(src / "buena.jpg", quality=95)
-    Image.fromarray((photo(seed=2) * 0.35).astype(np.uint8)).save(src / "oscura.jpg")
-    pm.run_enhance(src, out, "diagnose")
-    assert not list(out.glob("*.jpg"))
-    with open(out / "mejora_reporte.csv", encoding="utf-8") as f:
-        rows = {Path(r["archivo"]).name: r for r in csv.DictReader(f)}
-    assert rows["buena.jpg"]["acciones"].startswith("ninguna")
-    assert "ampliar rango tonal" in rows["oscura.jpg"]["acciones"]
-
-
-def test_auto_run_writes_images_and_report(tmp_path):
-    src, out = tmp_path / "src", tmp_path / "out"
-    src.mkdir()
-    Image.fromarray((photo() * 0.35).astype(np.uint8)).save(src / "oscura.jpg", quality=95)
-    pm.run_enhance(src, out, "auto")
-    assert (out / "oscura.jpg").exists()
-    assert (out / "mejora_reporte.csv").exists()
-
-
-def test_auto_copies_untouched_photos_byte_for_byte(tmp_path):
-    src, out = tmp_path / "src", tmp_path / "out"
-    src.mkdir()
-    Image.fromarray(photo()[:, :, ::-1]).save(src / "buena.jpg", quality=92)
-    pm.run_enhance(src, out, "auto")
-    assert (out / "buena.jpg").read_bytes() == (src / "buena.jpg").read_bytes()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -531,7 +438,7 @@ def test_realesrgan_mode_resizes_to_target_and_names_file(tmp_path, monkeypatch)
     src, out = tmp_path / "src", tmp_path / "out"
     src.mkdir()
     Image.fromarray(photo(640, 480)).save(src / "a.jpg", quality=95)
-    pm.run_enhance(src, out, "realesrgan", target="fullhd")
+    pm.run_enhance(src, out, target="fullhd")
     with Image.open(out / "a_FHD.jpg") as res:
         assert res.size == (1440, 1080)
 
@@ -541,7 +448,7 @@ def test_realesrgan_mode_caps_at_x4(tmp_path, monkeypatch):
     src, out = tmp_path / "src", tmp_path / "out"
     src.mkdir()
     Image.fromarray(photo(320, 240)).save(src / "mini.jpg")   # 4K pediría ×9
-    pm.run_enhance(src, out, "realesrgan", target="4k")
+    pm.run_enhance(src, out, target="4k")
     with Image.open(out / "mini_4K.jpg") as res:
         assert res.size == (1280, 960)
 
@@ -551,20 +458,9 @@ def test_realesrgan_mode_copies_photos_already_at_target(tmp_path, monkeypatch):
     src, out = tmp_path / "src", tmp_path / "out"
     src.mkdir()
     Image.fromarray(photo(2000, 1500)).save(src / "grande.jpg", quality=92)
-    pm.run_enhance(src, out, "realesrgan", target="fullhd")
+    pm.run_enhance(src, out, target="fullhd")
     assert (out / "grande.jpg").read_bytes() == (src / "grande.jpg").read_bytes()
     assert not (out / "grande_FHD.jpg").exists()
-
-
-def test_auto_does_not_upscale_photo_already_at_target(tmp_path):
-    exe = _fake_esrgan_exe(tmp_path)
-    _, a, actions = pm.enhance_adaptive(photo(2000, 1500), esrgan=exe, target="fullhd")
-    assert not a["needs_upscale"]
-    assert not any(x.startswith("super-resolución") for x in actions)
-    # La misma foto sí necesita ampliarse para 4K
-    _, a, actions = pm.enhance_adaptive(photo(2000, 1500), esrgan=exe,
-                                        target="4k", dry_run=True)
-    assert any(x.startswith("super-resolución") for x in actions)
 
 
 def test_script_folder_has_priority_over_env(tmp_path, monkeypatch):
@@ -585,16 +481,6 @@ def _many(src: Path, n: int = 6, w: int = 800, h: int = 600):
         if i % 2:
             img = (img * 0.4).astype(np.uint8)
         Image.fromarray(img).save(src / f"f{i}.jpg", quality=92)
-
-
-def test_parallel_auto_matches_serial(tmp_path):
-    _many(tmp_path / "src")
-    pm.run_enhance(tmp_path / "src", tmp_path / "s", "auto", workers=1)
-    pm.run_enhance(tmp_path / "src", tmp_path / "p", "auto", workers=3)
-    for f in sorted((tmp_path / "s").glob("*.jpg")):
-        assert f.read_bytes() == (tmp_path / "p" / f.name).read_bytes(), f.name
-    assert ((tmp_path / "s" / "mejora_reporte.csv").read_text()
-            == (tmp_path / "p" / "mejora_reporte.csv").read_text())
 
 
 def test_parallel_dedup_matches_serial(tmp_path, monkeypatch):
@@ -636,7 +522,7 @@ def test_realesrgan_runs_once_per_batch(tmp_path, monkeypatch):
     monkeypatch.setenv(pm.REALESRGAN_ENV, str(exe))
     src = tmp_path / "src"
     _many(src, n=5, w=640, h=480)
-    pm.run_enhance(src, tmp_path / "out", "realesrgan", target="fullhd")
+    pm.run_enhance(src, tmp_path / "out", target="fullhd")
     assert counter.read_text() == "x"            # 5 fotos, 1 sola ejecución
     for i in range(5):
         with Image.open(tmp_path / "out" / f"f{i}_FHD.jpg") as res:
@@ -679,214 +565,6 @@ def test_realesrgan_falls_back_to_one_by_one(tmp_path):
     exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
     ups = pm.realesrgan_batch([Image.fromarray(photo(64, 48))] * 3, exe, [2, 2, 2])
     assert [u.size for u in ups] == [(128, 96)] * 3
-
-
-# ──────────────────────────────────────────────────────────────
-# HDR de una sola foto (fusión de exposiciones)
-# ──────────────────────────────────────────────────────────────
-
-def window_scene(w=1600, h=1200, seed=0):
-    """Interior en sombra (izquierda) junto a una ventana luminosa (derecha)."""
-    import cv2
-    rng = np.random.default_rng(seed)
-    tex = cv2.resize(rng.integers(0, 255, (h // 20, w // 20), dtype=np.uint8), (w, h),
-                     interpolation=cv2.INTER_NEAREST).astype(np.float32) / 255
-    lum = np.empty((h, w), np.float32)
-    lum[:, :w // 2] = 0.08 + 0.20 * tex[:, :w // 2]
-    lum[:, w // 2:] = 0.70 + 0.25 * tex[:, w // 2:]
-    return (np.clip(np.dstack([lum * 0.95, lum, lum * 1.05]), 0, 1) * 255).astype(np.uint8)
-
-
-def _lum(bgr):
-    import cv2
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[:, :, 0].astype(float)
-
-
-@pytest.mark.parametrize("guided", [True, False])
-def test_hdr_lifts_shadows_without_burning_highlights(guided, monkeypatch):
-    monkeypatch.setattr(pm, "_HAS_GUIDED", guided and pm._HAS_GUIDED)
-    img = window_scene()
-    out = pm.enhance_hdr(img)
-    before, after = _lum(img), _lum(out)
-    half = img.shape[1] // 2
-    assert after[:, :half - 100].mean() > before[:, :half - 100].mean() + 15   # sombras
-    assert (after[:, half + 100:] >= 250).mean() <= (before[:, half + 100:] >= 250).mean()
-    assert after[:, half + 100:].std() >= before[:, half + 100:].std() * 0.9    # detalle luces
-
-
-def test_hdr_keeps_colors():
-    import cv2
-    img = np.clip(window_scene().astype(int) + [0, 0, 40], 0, 255).astype(np.uint8)
-    before = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)[:, :, 1:].astype(float)
-    after = cv2.cvtColor(pm.enhance_hdr(img), cv2.COLOR_BGR2LAB)[:, :, 1:].astype(float)
-    assert np.abs(after.mean(axis=(0, 1)) - before.mean(axis=(0, 1))).max() < 3
-
-
-def test_auto_applies_hdr_to_slightly_dark_photo():
-    """v1.10 solo aclaraba con brillo < 90: una foto 'un poco oscura' no se tocaba."""
-    # Tonos medios oscurecidos con rango completo (gamma 2): brillo medio ~97
-    img = ((photo() / 255.0) ** 2.0 * 255).astype(np.uint8)
-    assert 90 < _lum(img).mean() < 110
-    out, a, actions = pm.enhance_adaptive(img)
-    assert any(x.startswith(("HDR", "aclarar")) for x in actions)
-    assert _lum(out).mean() > _lum(img).mean() + 8
-
-
-def test_auto_applies_hdr_to_window_scene():
-    _, _, actions = pm.enhance_adaptive(window_scene())
-    assert any(x.startswith("HDR") for x in actions)
-
-
-def test_auto_no_hdr_on_well_exposed_photo():
-    _, _, actions = pm.enhance_adaptive(photo())
-    assert not any(x.startswith(("HDR", "aclarar")) for x in actions)
-
-
-def test_hdr_mode_writes_files(tmp_path):
-    src, out = tmp_path / "src", tmp_path / "out"
-    src.mkdir()
-    Image.fromarray(window_scene(800, 600)[:, :, ::-1]).save(src / "v.jpg", quality=95)
-    pm.run_enhance(src, out, "hdr")
-    with Image.open(out / "v.jpg") as res, Image.open(src / "v.jpg") as orig:
-        after = np.asarray(res.convert("L"))[:, :300].mean()      # zona en sombra
-        before = np.asarray(orig.convert("L"))[:, :300].mean()
-    assert after > before + 15
-
-
-def test_hdr_levels_are_ordered():
-    img = window_scene()
-    half = img.shape[1] // 2
-    lifts = [_lum(pm.enhance_hdr(img, lvl))[:, :half - 100].mean() for lvl in ("suave", "normal", "fuerte")]
-    assert lifts[0] < lifts[1] < lifts[2]
-    assert lifts[0] > _lum(img)[:, :half - 100].mean() + 10
-
-
-# ──────────────────────────────────────────────────────────────
-# Menú de mejora: 1 automático, 2 Real-ESRGAN, 3 HDR, 4 diagnóstico
-# ──────────────────────────────────────────────────────────────
-
-def _run_menu(monkeypatch, tmp_path, answers):
-    src = tmp_path / "fotos"
-    src.mkdir(exist_ok=True)
-    calls = []
-    monkeypatch.setattr(pm, "run_enhance", lambda *a, **k: calls.append((a, k)))
-    monkeypatch.setattr(pm, "find_realesrgan", lambda: tmp_path / "fake")
-    feed = iter([str(src), ""] + answers)
-    asked = []
-    monkeypatch.setattr("builtins.input", lambda prompt="": (asked.append(prompt), next(feed))[1])
-    pm.menu_enhance()
-    return calls, asked
-
-
-@pytest.mark.parametrize("opt, mode", [("1", "auto"), ("2", "realesrgan"), ("4", "diagnose")])
-def test_menu_auto_esrgan_diagnose_ask_nothing_and_use_max(opt, mode, monkeypatch, tmp_path):
-    calls, asked = _run_menu(monkeypatch, tmp_path, [opt])
-    assert len(asked) == 3                       # carpeta, salida, modo
-    (args, kwargs), = calls
-    assert args[2] == mode
-    assert kwargs["target"] == "4k" and kwargs["hdr"] == pm.AUTO_HDR
-
-
-@pytest.mark.parametrize("answer, level", [("1", "suave"), ("", "normal"), ("3", "fuerte")])
-def test_menu_hdr_asks_intensity(answer, level, monkeypatch, tmp_path):
-    calls, asked = _run_menu(monkeypatch, tmp_path, ["3", answer])
-    assert any("Intensidad" in q for q in asked)
-    (args, kwargs), = calls
-    assert args[2] == "hdr" and kwargs["hdr"] == level
-
-
-def test_auto_target_upscales_small_to_x4_but_not_large(tmp_path):
-    exe = _fake_esrgan_exe(tmp_path)
-    out, a, actions = pm.enhance_adaptive(photo(640, 480), esrgan=exe, target=pm.AUTO_TARGET)
-    assert out.shape[:2] == (1920, 2560)          # ×4 (4K pediría ×4,5)
-    _, a, actions = pm.enhance_adaptive(photo(4000, 3000), esrgan=exe,
-                                        target=pm.AUTO_TARGET, dry_run=True)
-    assert not any(x.startswith("super-resolución") for x in actions)
-
-
-# ──────────────────────────────────────────────────────────────
-# Fotos muy oscuras (selfie nocturno): aclarado completo
-# ──────────────────────────────────────────────────────────────
-
-def very_dark(seed=0):
-    """Foto muy subexpuesta con color (brillo ~50) y grano en las sombras."""
-    rng = np.random.default_rng(seed)
-    # Como una foto real: el negro no es 0 puro (sensor + compresión)
-    base = 8 + (photo(seed=seed) / 255.0) ** 3.0 * 200
-    base = base + rng.normal(0, 2.5, base.shape) * (base < 40)
-    return np.clip(base, 0, 255).astype(np.uint8)
-
-
-def _chroma(bgr):
-    import cv2
-    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(float)
-    return np.hypot(lab[..., 1] - 128, lab[..., 2] - 128).mean()
-
-
-def test_very_dark_photo_reaches_target_brightness():
-    img = very_dark()
-    assert _lum(img).mean() < 70
-    for level, target in pm.HDR_TARGET_MEAN.items():
-        out, gain, _ = pm.brighten_dark(img, level)
-        assert _lum(out).mean() >= target - 12, level
-        assert gain > 1.3
-
-
-def test_very_dark_keeps_color_and_depth():
-    img = very_dark()
-    out, _, _ = pm.brighten_dark(img, "fuerte")
-    assert _chroma(out) >= _chroma(img) * 0.95                 # no queda gris
-    lifted_black = np.percentile(_lum(pm.enhance_hdr(img, "fuerte")), 0.5)
-    assert np.percentile(_lum(out), 0.5) < lifted_black       # se quita neblina
-
-
-def test_black_point_restore_keeps_hdr_lift_in_window_scene():
-    img = window_scene()
-    half = img.shape[1] // 2
-    out, _, _ = pm.brighten_dark(img, "fuerte")
-    assert _lum(out)[:, :half - 100].mean() > _lum(img)[:, :half - 100].mean() + 25
-
-
-def test_auto_does_not_sharpen_after_brightening():
-    _, _, actions = pm.enhance_adaptive(very_dark())
-    assert any(a.startswith(("HDR", "aclarar")) for a in actions)
-    assert not any(a.startswith("enfocar") for a in actions)
-
-
-# ──────────────────────────────────────────────────────────────
-# Aclarado clásico con brillo automático (v1.14)
-# ──────────────────────────────────────────────────────────────
-
-def test_auto_uses_classic_chain_for_very_dark_photo():
-    img = very_dark()
-    out, a, actions = pm.enhance_adaptive(img)
-    assert any(x.startswith("aclarar") for x in actions)
-    limit = max(pm.AUTO_HIGHLIGHT_P98, np.percentile(_lum(img), 98) + pm.AUTO_HIGHLIGHT_MARGIN)
-    assert np.percentile(_lum(out), 98) <= limit + 3          # luces respetadas
-    assert _lum(out).mean() > _lum(img).mean() + 30
-
-
-def test_choose_brightness_lower_when_highlights_are_high():
-    dark_low_highlights = (photo() * 0.35).astype(np.uint8)
-    dark_high_highlights = dark_low_highlights.copy()
-    dark_high_highlights[:200, :] = 235                        # cielo claro
-    t_low, _ = pm.choose_brightness(dark_low_highlights)
-    t_high, _ = pm.choose_brightness(dark_high_highlights)
-    assert t_low is not None
-    assert t_high is None or t_high < t_low
-
-
-def test_classic_chain_keeps_more_contrast_than_hdr():
-    img = very_dark()
-    classic, _, _ = pm.brighten_classic(img)
-    hdr, _, _ = pm.brighten_dark(img, "normal")
-    assert _lum(classic).std() > _lum(hdr).std()
-    assert _chroma(classic) >= _chroma(img)
-
-
-def test_auto_uses_hdr_when_highlights_already_high():
-    _, _, actions = pm.enhance_adaptive(window_scene())
-    assert any(x.startswith("HDR") for x in actions)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -961,3 +639,18 @@ def test_compress_same_stem_different_formats_do_not_collide(tmp_path):
     Image.fromarray(_textured(400, 300, seed=4)).save(src / "foto.tif")
     pm.run_compress(src, out, fmt="jpeg", quality=70)
     assert len(list(out.glob("foto*"))) == 4
+
+
+def test_menu_enhance_asks_only_folders_and_uses_4k(monkeypatch, tmp_path):
+    src = tmp_path / "fotos"
+    src.mkdir()
+    calls = []
+    monkeypatch.setattr(pm, "run_enhance", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(pm, "find_realesrgan", lambda: tmp_path / "fake")
+    feed = iter([str(src), ""])
+    asked = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": (asked.append(prompt), next(feed))[1])
+    pm.menu_enhance()
+    assert len(asked) == 2                       # carpeta y salida
+    (args, kwargs), = calls
+    assert kwargs["target"] == "4k"

@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
 """
-Photo Manager CLI v1.15.0
+Photo Manager CLI v2.0.0
 Herramienta de gestión de fotos.
 
 Funcionalidades:
   1. Deduplicar fotos (pHash + BK-tree + complete-link, caché SQLite)
   2. Comparar dos carpetas en busca de duplicados cruzados
-  3. Mejorar fotos:
-       - Automático: analiza cada foto y corrige solo lo necesario
-         (super-resolución hasta 4K con Real-ESRGAN, ruido, color, rango,
-         HDR fuerte en fotos oscuras, nitidez)
-       - Real-ESRGAN: amplía hasta 4K (máximo ×4)
-       - HDR: aclara sombras sin quemar luces (suave / normal / fuerte)
-       - Diagnóstico: reporte de lo que haría el modo automático
+  3. Ampliar fotos con Real-ESRGAN (realesrgan-ncnn-vulkan v0.2.5.0,
+     modelo realesrgan-x4plus): hasta 4K, máximo ×4, por lotes
   4. Detectar fotos borrosas (varianza del Laplaciano, resolución normalizada)
   5. Comprimir / Convertir (HEIF, WebP, JPEG; recomprime HEIC; reduce resolución)
 
 Dependencias:
-  pip install Pillow imagehash pillow-heif opencv-contrib-python==4.10.0.84
+  pip install Pillow imagehash numpy pillow-heif
+  Opcional (detección de borrosas más precisa): pip install opencv-python-headless
 
 Real-ESRGAN (opcional, sin PyTorch ni CUDA; usa GPU vía Vulkan):
   Descarga realesrgan-ncnn-vulkan desde
@@ -73,7 +69,7 @@ try:
 except ImportError:
     _HEIF = False
 
-# OpenCV (opcional — para mejora y detección de blur)
+# OpenCV (opcional — solo afina la detección de fotos borrosas)
 try:
     import cv2
     _CV2 = True
@@ -84,7 +80,7 @@ except ImportError:
 # CONSTANTES
 # ══════════════════════════════════════════════════
 
-VERSION = "1.15.0"
+VERSION = "2.0.0"
 
 # [FIX #12] Separar formatos soportados por Pillow vs RAW
 PILLOW_EXTENSIONS = {
@@ -1180,14 +1176,6 @@ def run_dedup(source: Path, output: Path, compare: Path | None = None,
 # ══════════════════════════════════════════════════
 
 
-def _ensure_cv2():
-    if not _CV2:
-        print("  ✗ OpenCV no disponible. Instala:")
-        print("    pip install opencv-contrib-python==4.10.0.84")
-        return False
-    return True
-
-
 def _load_oriented_rgb(img_path: Path) -> Image.Image:
     """Abre con Pillow (soporta HEIC), aplica la orientación EXIF y pasa a RGB.
 
@@ -1198,14 +1186,6 @@ def _load_oriented_rgb(img_path: Path) -> Image.Image:
         if getattr(opened, "n_frames", 1) > 1:
             raise ValueError("imagen animada/multipágina: omitida")
         return ImageOps.exif_transpose(opened).convert("RGB")
-
-
-def _pil_to_bgr(img: Image.Image):
-    return np.asarray(img)[:, :, ::-1].copy()
-
-
-def _bgr_to_pil(arr) -> Image.Image:
-    return Image.fromarray(np.ascontiguousarray(arr[:, :, ::-1]))
 
 
 _PIL_SAVE_FORMATS = {
@@ -1264,17 +1244,6 @@ def _save_pil(img: Image.Image, dst: Path, source: Path,
         except Exception:
             dst.unlink(missing_ok=True)
     return None, False
-
-
-def enhance_denoise(img, strength: int = 6):
-    """Reducción de ruido preservando detalle."""
-    return cv2.fastNlMeansDenoisingColored(img, None, strength, strength, 7, 21)
-
-
-def enhance_sharpen(img, amount: float = 0.5):
-    """Unsharp mask."""
-    blurred = cv2.GaussianBlur(img, (0, 0), 3)
-    return cv2.addWeighted(img, 1 + amount, blurred, -amount, 0)
 
 
 _REALESRGAN_NAMES = ("realesrgan-ncnn-vulkan", "realesrgan-ncnn-vulkan.exe")
@@ -1352,7 +1321,6 @@ DEFAULT_TARGET = "fullhd"
 # foto de 12 MP daría 192 MP: archivos de ~100 MB y horas de GPU.)
 AUTO_TARGET = "4k"
 REALESRGAN_MAX_SCALE = 4.0   # el modelo x4plus no da más de ×4
-AUTO_MIN_UPSCALE = 1.25      # en modo auto, no vale la pena ampliar menos
 
 
 def upscale_factor(width: int, height: int, target: str) -> float:
@@ -1499,579 +1467,6 @@ def _esrgan_chunks(items: list, sizes: list[tuple[int, int]]):
         yield chunk
 
 
-# ── Modo automático adaptativo ────────────────────
-# Umbrales calibrados con imágenes sintéticas, NO con una biblioteca real.
-# Si el diagnóstico (mejora_reporte.csv) no coincide con tu criterio, ajústalos.
-AUTO_LOWRES_SIDE = 1600   # lado mayor (px) por debajo → baja resolución
-AUTO_NOISE_SIGMA = 4.0    # ruido estimado (σ en escala 0-255)
-AUTO_BRIGHT_MEAN = 185    # luminancia media por encima → sobreexpuesta
-AUTO_LOW_RANGE = 170      # rango tonal p0.5–p99.5 por debajo → plana/lavada
-AUTO_CAST = 5.0           # tinte medio de los píxeles neutros (a/b en LAB)
-AUTO_NEUTRAL_CHROMA = 22  # croma máx. para considerar un píxel "casi neutro"
-AUTO_NEUTRAL_MIN_SHARE = 0.05  # mínimo de neutros (5 %) para poder juzgar
-AUTO_SOFT = 100.0         # varianza del Laplaciano a 1000 px → poco nítida
-AUTO_HDR_MEAN = 110       # brillo medio por debajo → HDR (levantar sombras)
-AUTO_HDR_SHADOWS = 0.30   # …o si más del 30 % de la foto está en sombra
-HDR_SHADOW_LEVEL = 70     # luminancia (0-255) por debajo de la cual es "sombra"
-# Intensidad del HDR: (exponente de la exposición clara, fuerza de la mezcla).
-# Medido en una foto oscura (brillo 97) y en un interior junto a una ventana
-# (sombras 47): suave → 104 / 66, normal → 109 / 80, fuerte → 115 / 94.
-HDR_LEVELS = {
-    "suave":  (0.55, 0.7),
-    "normal": (0.45, 0.9),
-    "fuerte": (0.40, 1.0),
-}
-DEFAULT_HDR = "normal"
-AUTO_HDR = "normal"        # valor por defecto para run_enhance (el auto lo elige solo)
-HDR_WEIGHT_MAX_PX = 2_000_000   # resolución máx. para calcular los pesos
-
-
-def estimate_noise(gray) -> float:
-    """σ del ruido (método de Immerkær) medido solo en zonas lisas.
-
-    Los bordes y texturas se excluyen (30 % de píxeles con menor gradiente)
-    para no confundir detalle con ruido.
-    """
-    h, w = gray.shape[:2]
-    if h < 16 or w < 16:
-        return 0.0
-    # Recorte central para fotos grandes: el ruido es homogéneo
-    if h * w > 4_000_000:
-        cy, cx, r = h // 2, w // 2, 1024
-        gray = gray[max(cy - r, 0):cy + r, max(cx - r, 0):cx + r]
-    g = gray.astype(np.float64)
-    kernel = np.array([[1, -2, 1], [-2, 4, -2], [1, -2, 1]], dtype=np.float64)
-    resp = np.abs(cv2.filter2D(g, -1, kernel, borderType=cv2.BORDER_REFLECT))
-    grad = np.hypot(cv2.Sobel(g, cv2.CV_64F, 1, 0), cv2.Sobel(g, cv2.CV_64F, 0, 1))
-    flat = grad <= np.percentile(grad, 30)
-    if flat.sum() < 100:
-        return 0.0
-    return float(math.sqrt(math.pi / 2) * resp[flat].mean() / 6)
-
-
-def analyze_image(bgr) -> dict:
-    """Mide lo que la foto necesita: resolución, ruido, exposición,
-    rango tonal, dominante de color y nitidez.
-
-    Tono, color y nitidez se miden sobre una copia de BLUR_MAX_SIDE px
-    (las estadísticas apenas cambian y es ~10× más rápido en 12 MP); el
-    ruido se mide a resolución completa porque al reducir desaparece.
-    """
-    h, w = bgr.shape[:2]
-    small_bgr = bgr
-    if max(h, w) > BLUR_MAX_SIDE:
-        f = BLUR_MAX_SIDE / max(h, w)
-        small_bgr = cv2.resize(bgr, (max(1, round(w * f)), max(1, round(h * f))),
-                               interpolation=cv2.INTER_AREA)
-    lab = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2LAB)
-    lum = lab[:, :, 0]
-    p_lo, p_hi = (float(v) for v in np.percentile(lum, (0.5, 99.5)))
-
-    # Dominante de color: se mide SOLO en píxeles casi neutros de tonos medios.
-    # Una foto de bosque o un atardecer tiene media verde/naranja pero sus
-    # grises siguen siendo grises; con una dominante real, los grises se tiñen.
-    # (El "gray world" de v1.6 promediaba toda la foto y neutralizaba eso.)
-    a_ch = lab[:, :, 1].astype(np.float32) - 128
-    b_ch = lab[:, :, 2].astype(np.float32) - 128
-    mid = (lum > 40) & (lum < 230)
-    neutral = mid & (np.hypot(a_ch, b_ch) < AUTO_NEUTRAL_CHROMA)
-    neutral_share = float(neutral.sum()) / max(int(mid.sum()), 1)
-    if neutral.sum() > 500 and neutral_share >= AUTO_NEUTRAL_MIN_SHARE:
-        da = float(a_ch[neutral].mean())
-        db = float(b_ch[neutral].mean())
-    else:
-        da = db = 0.0          # sin suficientes neutros: no se puede saber
-
-    small = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY)
-
-    return {
-        "width": w, "height": h,
-        "low_res": max(w, h) < AUTO_LOWRES_SIDE,
-        "noise": estimate_noise(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)),
-        "mean": float(lum.mean()),
-        "p_lo": p_lo, "p_hi": p_hi, "range": p_hi - p_lo,
-        "da": da, "db": db, "cast": math.hypot(da, db),
-        "sharpness": float(cv2.Laplacian(small, cv2.CV_64F).var()),
-    }
-
-
-def _lab_apply(bgr, fn):
-    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    fn(lab)
-    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
-
-
-def _correct_cast(bgr, da: float, db: float, strength: float = 0.7):
-    """Desplaza a/b en LAB hacia el neutro (parcial: respeta tonos cálidos)."""
-    def fn(lab):
-        lab[:, :, 1] -= da * strength
-        lab[:, :, 2] -= db * strength
-    return _lab_apply(bgr, fn)
-
-
-def _stretch_levels(bgr, p_lo: float, p_hi: float, max_gain: float = 1.6):
-    """Estira la luminancia p_lo→0 y p_hi→255 (solo L: no altera el color)."""
-    span = max(p_hi - p_lo, 1.0)
-    gain = min(255.0 / span, max_gain)
-    center = (p_lo + p_hi) / 2
-
-    def fn(lab):
-        lab[:, :, 0] = (lab[:, :, 0] - center) * gain + 127.5
-    return _lab_apply(bgr, fn)
-
-
-def _pyr_levels(h: int, w: int) -> int:
-    return int(min(max(math.log2(max(min(h, w), 1)) - 3, 3), 8))
-
-
-def _gauss_pyr(img, levels: int) -> list:
-    pyr = [img]
-    for _ in range(levels - 1):
-        pyr.append(cv2.pyrDown(pyr[-1]))
-    return pyr
-
-
-def _lap_pyr(img, levels: int) -> list:
-    g = _gauss_pyr(img, levels)
-    lap = [g[i] - cv2.pyrUp(g[i + 1], dstsize=(g[i].shape[1], g[i].shape[0]))
-           for i in range(levels - 1)]
-    lap.append(g[-1])
-    return lap
-
-
-def _hdr_exposures(lum, bright: float = 0.45):
-    """Exposiciones sintéticas de la luminancia (0-1): más oscura (protege
-    luces), original, más clara (abre sombras) y con contraste local."""
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    local = clahe.apply((lum * 255).astype(np.uint8)).astype(np.float32) / 255
-    yield np.power(lum, 1.5)
-    yield lum
-    yield np.power(lum, bright)
-    yield local
-
-
-def _hdr_weight(exp):
-    """Peso de Mertens: bien expuesto (cerca de 0,5) × contraste local.
-
-    El contraste se mide tras un leve desenfoque para que el ruido de las
-    sombras no cuente como 'detalle'.
-    """
-    well_exposed = np.exp(-((exp - 0.5) ** 2) / (2 * 0.2 ** 2))
-    contrast = np.abs(cv2.Laplacian(cv2.GaussianBlur(exp, (0, 0), 1.0), cv2.CV_32F))
-    return well_exposed * (contrast + 0.02) + 1e-6
-
-
-def _well_exposed(x):
-    return np.exp(-((x - 0.5) ** 2) / (2 * 0.2 ** 2)) + 1e-6
-
-
-def _hdr_fuse_guided(lum, bright: float):
-    """Fusión con pesos suavizados por filtro guiado (Li et al. 2013).
-
-    El filtro respeta los bordes de la propia foto: una zona en sombra junto
-    a una ventana no hereda el peso de la ventana, así que no aparece el
-    halo oscuro de la mezcla por pirámides (medido: −10 → ~0).
-    El peso se evalúa sobre la base suavizada (escala grande) y se aplica a
-    la exposición completa, que conserva el detalle fino.
-    """
-    gf = cv2.ximgproc.guidedFilter
-    h, w = lum.shape
-    # Los pesos son mapas suaves: se calculan sobre una copia de ≤2 MP y se
-    # amplían. Reduce memoria y tiempo ~4× en fotos grandes sin efecto visible.
-    f = min(1.0, math.sqrt(HDR_WEIGHT_MAX_PX / (h * w)))
-    small = (cv2.resize(lum, (max(1, round(w * f)), max(1, round(h * f))),
-                        interpolation=cv2.INTER_AREA) if f < 1 else lum)
-    r = max(4, min(small.shape) // 48)
-    eps = 1e-3
-    base = gf(small, small, r, eps)
-    num = np.zeros_like(lum)
-    den = np.zeros_like(lum)
-    for exp, exp_base in zip(_hdr_exposures(lum, bright), _hdr_exposures(base, bright)):
-        wmap = np.maximum(gf(small, _well_exposed(exp_base), r, eps), 1e-6)
-        if f < 1:
-            wmap = cv2.resize(wmap, (w, h), interpolation=cv2.INTER_LINEAR)
-        num += wmap * exp
-        den += wmap
-    return num / den
-
-
-def _hdr_fuse_pyramid(lum, bright: float):
-    """Respaldo sin ximgproc: fusión de Mertens por pirámides de Laplace
-    (puede dejar un halo oscuro leve junto a bordes muy contrastados)."""
-    h, w = lum.shape
-    levels = _pyr_levels(h, w)
-    weight_sum = sum(_hdr_weight(e) for e in _hdr_exposures(lum, bright))
-    fused = None
-    for exp in _hdr_exposures(lum, bright):
-        wpyr = _gauss_pyr(_hdr_weight(exp) / weight_sum, levels)
-        lpyr = _lap_pyr(exp, levels)
-        contrib = [wl * ll for wl, ll in zip(wpyr, lpyr)]
-        fused = contrib if fused is None else [f + c for f, c in zip(fused, contrib)]
-    del weight_sum
-    out = fused[-1]
-    for lvl in reversed(fused[:-1]):
-        out = cv2.pyrUp(out, dstsize=(lvl.shape[1], lvl.shape[0])) + lvl
-    return out
-
-
-_HAS_GUIDED = _CV2 and hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "guidedFilter")
-
-
-def enhance_hdr(bgr, level: str = DEFAULT_HDR):
-    """HDR de una sola foto: fusión de exposiciones sintéticas.
-
-    Genera versiones más oscura, original, más clara y con contraste local
-    de la luminancia, y las mezcla zona a zona tomando la mejor expuesta.
-    No inventa información (un JPEG no tiene la de varias exposiciones
-    reales, como el iPhone), pero aclara sombras sin quemar las luces.
-    Solo actúa sobre la luminancia: los colores se conservan.
-    """
-    bright, strength = HDR_LEVELS[level]
-    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    lum = lab[:, :, 0] / 255.0
-    fused = (_hdr_fuse_guided(lum, bright) if _HAS_GUIDED
-             else _hdr_fuse_pyramid(lum, bright))
-    fused = np.clip(fused, 0.0, 1.0)
-    lab[:, :, 0] = np.clip((lum + strength * (fused - lum)) * 255, 0, 255)
-    return cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
-
-
-# Brillo medio objetivo tras aclarar, según intensidad (LAB 0-255; ~118 = medio)
-HDR_TARGET_MEAN = {"suave": 100, "normal": 110, "fuerte": 120}
-# Cuánto del negro original se recupera tras el HDR (0 = nada, foto lavada;
-# 1 = todo, deshace parte del aclarado y destapa grano en zonas oscuras).
-# Elegido sobre una foto real (selfie nocturno de WhatsApp) y una escena
-# sintética de interior con ventana.
-HDR_BLACK_RESTORE = 0.6
-HDR_DEEP_SHADOW = 45   # luminancia original por debajo: limpieza fuerte tras aclarar
-
-
-def _restore_black_point(bgr, black: float, knee: float = 40.0):
-    """Devuelve el negro (percentil 0,5) a `black` solo en los tonos más bajos.
-
-    El HDR levanta también los negros y la foto queda con neblina. Una
-    curva de "pie": baja el negro hasta `black` y el efecto se desvanece
-    hasta desaparecer `knee` niveles más arriba, así que los tonos medios
-    (lo que el HDR aclaró) no se tocan.
-    """
-    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
-    lo = float(np.percentile(lab[:, :, 0], 0.5))
-    if lo <= black + 1:
-        return bgr
-    x = np.arange(256, dtype=np.float32)
-    offset = (lo - black) * np.clip(1 - (x - lo) / knee, 0, 1)
-    lut = np.where(x <= lo, x * black / max(lo, 1), x - offset)
-    lab[:, :, 0] = cv2.LUT(lab[:, :, 0], np.clip(lut, 0, 255).astype(np.uint8))
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-
-def _restore_saturation(before, after, amount: float = 0.7, max_gain: float = 1.8):
-    """Aumenta el color en proporción al aclarado de cada zona.
-
-    Al subir solo la luminancia, los colores conservan su intensidad
-    absoluta y se ven grises (piel apagada). El factor sale de un mapa
-    suavizado para no amplificar el ruido de color.
-    """
-    lb = cv2.cvtColor(before, cv2.COLOR_BGR2LAB).astype(np.float32)
-    la = cv2.cvtColor(after, cv2.COLOR_BGR2LAB).astype(np.float32)
-    gain = cv2.GaussianBlur((la[:, :, 0] + 8) / (lb[:, :, 0] + 8), (0, 0), 5)
-    gain = np.clip(1 + amount * (gain - 1), 1.0, max_gain)
-    for c in (1, 2):
-        la[:, :, c] = 128 + (la[:, :, c] - 128) * gain
-    return cv2.cvtColor(np.clip(la, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
-
-
-def brighten_dark(bgr, level: str = DEFAULT_HDR) -> tuple:
-    """Aclara una foto oscura: HDR + punto negro + brillo + color + limpieza.
-
-    1. HDR (fusión de exposiciones): abre sombras sin quemar luces.
-    2. Recupera parte del negro original (HDR_BLACK_RESTORE): quita la
-       neblina sin deshacer el aclarado de los tonos medios.
-    3. Brillo global hacia HDR_TARGET_MEAN[level] si aún queda oscura
-       (las fotos muy subexpuestas no llegan solo con el HDR).
-    4. Saturación proporcional al aclarado: evita la piel gris.
-    5. Limpieza proporcional al aclarado: el ruido y las manchas de color
-       que estaban ocultos en la oscuridad se hacen visibles al aclarar
-       (el ruido medido ANTES de aclarar no lo refleja). Fuerte en color,
-       suave en luminancia, para conservar el detalle; y fuerte en todo
-       donde el original era casi negro.
-    Devuelve (imagen, aclarado medio ×, h de limpieza o 0).
-    """
-    lum_before = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[:, :, 0]
-    black = float(np.percentile(lum_before, 0.5))
-    out = enhance_hdr(bgr, level)
-    lifted_black = float(np.percentile(cv2.cvtColor(out, cv2.COLOR_BGR2LAB)[:, :, 0], 0.5))
-    out = _restore_black_point(
-        out, lifted_black - HDR_BLACK_RESTORE * (lifted_black - black))
-    target = HDR_TARGET_MEAN[level]
-    mean = float(cv2.cvtColor(out, cv2.COLOR_BGR2LAB)[:, :, 0].mean())
-    if mean < target:
-        out = _gamma_toward(out, mean, target=target, amount=0.8)
-    out = _restore_saturation(bgr, out)
-
-    out, gain, h = _denoise_after_lift(lum_before, out)
-    return out, gain, h
-
-
-def _denoise_after_lift(lum_before, out) -> tuple:
-    """Limpieza proporcional a cuánto se aclaró la foto.
-
-    El ruido y las manchas de color que estaban ocultos en la oscuridad se
-    hacen visibles al aclarar (el ruido medido ANTES no lo refleja). Fuerte
-    en color y suave en luminancia, para conservar el detalle; fuerte en
-    todo donde el original era casi negro. Devuelve (imagen, aclarado ×, h).
-    """
-    gain = (float(cv2.cvtColor(out, cv2.COLOR_BGR2LAB)[:, :, 0].mean()) + 8) / \
-           (float(lum_before.mean()) + 8)
-    h = 0
-    if gain >= 1.3:
-        h = int(np.clip(round(1 + 2.5 * (gain - 1)), 2, 6))
-        h_color = int(np.clip(round(4 + 8 * (gain - 1)), 4, 14))
-        out = cv2.fastNlMeansDenoisingColored(out, None, h, h_color, 7, 21)
-        # Lo que era casi negro se aclaró muchísimo más que el resto y queda
-        # con grano: limpieza fuerte solo ahí, con transición suave.
-        mask = np.clip((HDR_DEEP_SHADOW - lum_before.astype(np.float32)) / 30, 0, 1)
-        if mask.mean() > 0.03:
-            mask = cv2.GaussianBlur(mask, (0, 0), 6)[..., None]
-            strong = cv2.fastNlMeansDenoisingColored(out, None, 8, 12, 7, 21)
-            out = (mask * strong + (1 - mask) * out).astype(np.uint8)
-    return out, gain, h
-
-
-# ── Aclarado clásico con brillo automático ────────
-# Cadena de un fotógrafo: exposición (igual en R, G, B, con "hombro" que
-# frena antes del blanco) → curva S → vibrance → calidez si está azulada →
-# limpieza. Con una foto real (selfie nocturno) quedó más natural que la
-# fusión HDR: mismo brillo y el triple de contraste en la cara.
-AUTO_BRIGHT_MIN = 100        # objetivos de brillo medio que se prueban
-AUTO_BRIGHT_MAX = 140
-AUTO_BRIGHT_STEP = 5
-# Límite para las zonas claras (percentil 98 de la luminancia). Calibrado con
-# la foto real: objetivo 120 → 222 (natural), 140 → 235 (cielo y pelo
-# blanquecinos). Si las luces ya estaban altas, se permite +8 sobre ellas.
-AUTO_HIGHLIGHT_P98 = 224
-AUTO_HIGHLIGHT_MARGIN = 8
-AUTO_MAX_BURN = 0.05         # % máx. de píxeles quemados (≥ 250)
-AUTO_MAX_GAIN = 3.0          # aclarado máx.: más allá el ruido se dispara
-AUTO_BACKLIT_GAIN = 1.08     # si la cadena no aclara más que esto → contraluz
-AUTO_BACKLIT_HDR = "normal"  # intensidad del HDR para contraluces
-
-
-def _exposure_lut(k: float):
-    """Curva de exposición con hombro: y = (1 − e^(−kx)) / (1 − e^(−k))."""
-    x = np.arange(256) / 255.0
-    return np.clip((1 - np.exp(-k * x)) / (1 - np.exp(-k)) * 255, 0, 255).astype(np.uint8)
-
-
-def _s_curve(bgr, amount: float = 0.25):
-    """Curva S suave sobre la luminancia: devuelve volumen tras aclarar."""
-    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
-    x = np.arange(256) / 255.0
-    curve = x + amount * (x - 0.5) * (1 - np.abs(2 * x - 1))
-    lab[:, :, 0] = cv2.LUT(lab[:, :, 0], np.clip(curve * 255, 0, 255).astype(np.uint8))
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-
-def _vibrance(bgr, amount: float = 0.5):
-    """Sube más el color de lo poco saturado (piel) que de lo ya intenso."""
-    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    chroma = np.hypot(lab[..., 1] - 128, lab[..., 2] - 128)
-    factor = 1 + amount * np.clip(1 - chroma / 40, 0, 1)
-    for c in (1, 2):
-        lab[..., c] = 128 + (lab[..., c] - 128) * factor
-    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
-
-
-def _classic_chain(bgr, k: float):
-    return _s_curve(cv2.LUT(bgr, _exposure_lut(k)))
-
-
-def choose_brightness(bgr) -> tuple[int | None, float]:
-    """Elige el brillo objetivo más alto que no blanquee las zonas claras.
-
-    Prueba de AUTO_BRIGHT_MAX hacia abajo (sobre una copia reducida, rápido)
-    y devuelve (objetivo, k de la curva). (None, 0) si ninguno cumple.
-    """
-    h, w = bgr.shape[:2]
-    small = bgr
-    if max(h, w) > BLUR_MAX_SIDE:
-        f = BLUR_MAX_SIDE / max(h, w)
-        small = cv2.resize(bgr, (max(1, round(w * f)), max(1, round(h * f))),
-                           interpolation=cv2.INTER_AREA)
-    lum = lambda x: cv2.cvtColor(x, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
-    l0 = lum(small)
-    limit = max(AUTO_HIGHLIGHT_P98, float(np.percentile(l0, 98)) + AUTO_HIGHLIGHT_MARGIN)
-    for target in range(AUTO_BRIGHT_MAX, AUTO_BRIGHT_MIN - 1, -AUTO_BRIGHT_STEP):
-        lo, hi = 0.01, 20.0                      # k que da ese brillo medio
-        for _ in range(20):
-            k = (lo + hi) / 2
-            if lum(cv2.LUT(small, _exposure_lut(k))).mean() < target:
-                lo = k
-            else:
-                hi = k
-        l1 = lum(_classic_chain(small, k))
-        gain = (l1.mean() + 8) / (l0.mean() + 8)
-        if (np.percentile(l1, 98) <= limit and (l1 >= 250).mean() * 100 <= AUTO_MAX_BURN
-                and gain <= AUTO_MAX_GAIN):
-            return target, k
-    return None, 0.0
-
-
-def brighten_classic(bgr, analysis: dict | None = None) -> tuple:
-    """Aclara con la cadena clásica y brillo elegido automáticamente.
-
-    Devuelve (imagen, objetivo | None, aclarado ×). Si ningún objetivo
-    respeta las zonas claras, devuelve la imagen sin cambios.
-    """
-    target, k = choose_brightness(bgr)
-    lum_before = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[:, :, 0]
-    if target is None:
-        return bgr, None, 1.0
-    out = _vibrance(_classic_chain(bgr, k))
-    a = analysis or {}
-    if a.get("db", 0) < -3:                      # neutros azulados → calentar
-        lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB).astype(np.float32)
-        lab[..., 2] += min(-a["db"], 10) * 0.7
-        out = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
-    out, gain, _ = _denoise_after_lift(lum_before, out)
-    return out, target, gain
-
-
-def _shadow_share(bgr) -> float:
-    """Fracción de la foto en sombra (medida sobre una copia reducida)."""
-    h, w = bgr.shape[:2]
-    small = bgr
-    if max(h, w) > BLUR_MAX_SIDE:
-        f = BLUR_MAX_SIDE / max(h, w)
-        small = cv2.resize(bgr, (max(1, round(w * f)), max(1, round(h * f))),
-                           interpolation=cv2.INTER_AREA)
-    lum = cv2.cvtColor(small, cv2.COLOR_BGR2LAB)[:, :, 0]
-    return float((lum < HDR_SHADOW_LEVEL).mean())
-
-
-def _gamma_toward(bgr, mean: float, target: float = 118.0, amount: float = 0.6):
-    """Gamma en L que acerca la media a `target`, solo parcialmente."""
-    mean = min(max(mean, 1.0), 254.0)
-    gamma = math.log(target / 255) / math.log(mean / 255)
-    gamma = 1 + amount * (gamma - 1)
-    gamma = min(max(gamma, 0.55), 1.6)
-    lut = np.array([((i / 255.0) ** gamma) * 255 for i in range(256)],
-                   dtype=np.float32)
-
-    def fn(lab):
-        lab[:, :, 0] = lut[lab[:, :, 0].astype(np.uint8)]
-    return _lab_apply(bgr, fn)
-
-
-def enhance_adaptive(bgr, esrgan: Path | None = None, dry_run: bool = False,
-                     target: str = DEFAULT_TARGET, analysis: dict | None = None,
-                     upscaled=None, hdr: str = DEFAULT_HDR):
-    """Analiza la foto y aplica solo las correcciones que necesita.
-
-    Retorna (imagen BGR, análisis, lista de acciones legibles).
-    Orden: super-resolución → ruido → color → rango → exposición → nitidez.
-    Con dry_run=True decide igual pero omite los pasos lentos (super-
-    resolución y reducción de ruido); sirve para el modo diagnóstico.
-    `target` (clave de UPSCALE_TARGETS) fija la resolución final: solo se
-    amplía si la foto no la alcanza por al menos AUTO_MIN_UPSCALE.
-    `analysis`: análisis ya calculado (evita repetirlo).
-    `upscaled`: imagen BGR ya ampliada por un lote de Real-ESRGAN; si se
-    pasa, se usa en lugar de llamar al programa.
-    """
-    a = analysis or analyze_image(bgr)
-    actions = []
-
-    needed = upscale_factor(a["width"], a["height"], target)
-    a["upscale_needed"] = needed
-    a["needs_upscale"] = needed >= AUTO_MIN_UPSCALE
-
-    pre_upscaled, upscaled = upscaled, False
-    if a["needs_upscale"] and (esrgan or pre_upscaled is not None):
-        # Real-ESRGAN además limpia ruido y artefactos JPEG
-        scale = min(needed, REALESRGAN_MAX_SCALE)
-        new_w, new_h = target_size(a["width"], a["height"], scale)
-        if pre_upscaled is not None:
-            bgr = pre_upscaled
-        elif not dry_run:
-            bgr = _pil_to_bgr(realesrgan_upscale(_bgr_to_pil(bgr), esrgan, scale))
-        capped = " (limitado a ×4)" if needed > REALESRGAN_MAX_SCALE else ""
-        actions.append(f"super-resolución ×{scale:.2g} ({a['width']}x{a['height']} → "
-                       f"{new_w}x{new_h}){capped}")
-        upscaled = True
-
-    if not upscaled and a["noise"] > AUTO_NOISE_SIGMA:
-        strength = int(min(max(round(a["noise"] * 1.2), 3), 12))
-        if not dry_run:
-            bgr = enhance_denoise(bgr, strength=strength)
-        actions.append(f"reducir ruido (σ={a['noise']:.1f}, h={strength})")
-
-    if a["cast"] > AUTO_CAST:
-        bgr = _correct_cast(bgr, a["da"], a["db"])
-        actions.append(f"corregir dominante de color ({a['cast']:.0f})")
-
-    if a["range"] < AUTO_LOW_RANGE:
-        bgr = _stretch_levels(bgr, a["p_lo"], a["p_hi"])
-        actions.append(f"ampliar rango tonal ({a['range']:.0f} → ~255)")
-
-    mean = float(cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[:, :, 0].mean())
-    shadows = _shadow_share(bgr)
-    a["shadows"] = shadows
-    brightened = False
-    if mean < AUTO_HDR_MEAN or shadows > AUTO_HDR_SHADOWS:
-        target, k = choose_brightness(bgr)
-        small_gain = 1.0
-        if target is not None:
-            small = cv2.resize(bgr, (max(1, bgr.shape[1] // 4), max(1, bgr.shape[0] // 4)),
-                               interpolation=cv2.INTER_AREA)
-            lum_s = cv2.cvtColor(small, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
-            lum_c = cv2.cvtColor(_classic_chain(small, k), cv2.COLOR_BGR2LAB)[:, :, 0]
-            small_gain = (lum_c.mean() + 8) / (lum_s.mean() + 8)
-        if target is None or small_gain < AUTO_BACKLIT_GAIN:
-            # Luces ya altas (contraluz, ventana, cielo): la exposición global
-            # no puede abrir las sombras sin blanquearlas → fusión HDR.
-            if not dry_run:
-                bgr, gain, _ = brighten_dark(bgr, AUTO_BACKLIT_HDR)
-                a["brighten_gain"] = gain
-            actions.append(f"HDR: aclarar sombras, luces ya altas (brillo {mean:.0f}, "
-                           f"sombras {shadows * 100:.0f} %)")
-        else:
-            if not dry_run:
-                bgr, _, gain = brighten_classic(bgr, a)
-                a["brighten_gain"] = gain
-            a["brightness_target"] = target
-            actions.append(f"aclarar: brillo {mean:.0f} → {target} (automático)")
-        brightened = True
-    elif mean > AUTO_BRIGHT_MEAN:
-        bgr = _gamma_toward(bgr, mean)
-        actions.append(f"oscurecer (brillo {mean:.0f})")
-
-    if not upscaled and not brightened and a["sharpness"] < AUTO_SOFT:
-        # No se enfoca tras aclarar: realzaría el grano que el aclarado destapa.
-        # Enfoque suave si hay ruido o baja resolución: evita realzar artefactos
-        amount = 0.3 if (a["noise"] > AUTO_NOISE_SIGMA or a["low_res"]) else 0.6
-        bgr = enhance_sharpen(bgr, amount=amount)
-        actions.append(f"enfocar ({amount}, nitidez {a['sharpness']:.0f})")
-
-    return bgr, a, actions
-
-
-def _auto_report_row(path: Path, a: dict, actions: list[str]) -> dict:
-    return {
-        "archivo": str(path),
-        "resolucion": f"{a['width']}x{a['height']}",
-        "baja_resolucion": "SI" if a["low_res"] else "",
-        "ampliacion_necesaria": (f"×{a['upscale_needed']:.2f}"
-                                 if a.get("needs_upscale") else ""),
-        "ruido_sigma": f"{a['noise']:.1f}",
-        "brillo_medio": f"{a['mean']:.0f}",
-        "sombras_pct": f"{a['shadows'] * 100:.0f}" if "shadows" in a else "",
-        "rango_tonal": f"{a['range']:.0f}",
-        "dominante_color": f"{a['cast']:.1f}",
-        "nitidez": f"{a['sharpness']:.0f}",
-        "acciones": "; ".join(actions) if actions else "ninguna (ya está bien)",
-    }
-
-
 def _oriented_size(path: Path) -> tuple[int, int]:
     """Tamaño tal como se ve la foto (orientación EXIF aplicada), sin decodificar."""
     with Image.open(path) as img:
@@ -2084,225 +1479,104 @@ def _oriented_size(path: Path) -> tuple[int, int]:
     return w, h
 
 
-def _enhance_task(job: dict) -> dict:
-    """Procesa una foto en un proceso aparte (CPU). Nunca lanza excepciones.
+def run_enhance(source: Path, output: Path, target: str = AUTO_TARGET):
+    """Amplía fotos con Real-ESRGAN (realesrgan-ncnn-vulkan, modelo x4plus).
 
-    status: ok | copied | esrgan (necesita ampliación: la hace el proceso
-    principal en la fase de GPU) | error
-    """
-    src, dst, mode = job["src"], job["dst"], job["mode"]
-    res = {"src": src, "status": "ok", "row": None, "analysis": None,
-           "actions": [], "meta_ok": True, "error": None}
-    try:
-        arr = _pil_to_bgr(_load_oriented_rgb(src))
-        if mode in ("auto", "diagnose"):
-            analysis = analyze_image(arr)
-            needed = upscale_factor(analysis["width"], analysis["height"], job["target"])
-            if mode == "auto" and job["esrgan"] and needed >= AUTO_MIN_UPSCALE:
-                res.update(status="esrgan", analysis=analysis)
-                return res
-            arr, analysis, actions = enhance_adaptive(
-                arr, job["esrgan"], dry_run=(mode == "diagnose"),
-                target=job["target"], analysis=analysis, hdr=job["hdr"])
-            res.update(analysis=analysis, actions=actions,
-                       row=_auto_report_row(src, analysis, actions))
-            if mode == "diagnose":
-                return res
-            if not actions:
-                # Nada que corregir: copia exacta, sin re-comprimir
-                shutil.copy2(str(src), str(dst))
-                res["status"] = "copied"
-                return res
-        else:                       # mode == "hdr"
-            arr, _, _ = brighten_dark(arr, job["hdr"])
-        written, meta_ok = _save_pil(_bgr_to_pil(arr), dst, src)
-        if not written:
-            raise OSError(f"no se pudo escribir {dst.name}")
-        res["meta_ok"] = meta_ok
-    except Exception as e:
-        res.update(status="error", error=f"{src.name}: {e}")
-    return res
-
-
-def run_enhance(source: Path, output: Path, mode: str,
-                target: str = DEFAULT_TARGET, workers: int | None = None,
-                hdr: str = DEFAULT_HDR):
-    """Ejecuta mejora de fotos.
-
-    Modos: auto (analiza y corrige solo lo necesario), diagnose (solo
-    reporte), realesrgan (super-resolución) y hdr (aclarar sombras).
-    `target` (clave de UPSCALE_TARGETS): resolución final para Real-ESRGAN,
-    tanto en el modo realesrgan como en auto.
-
-    Dos fases: 1) CPU en paralelo (análisis, ajustes, guardado);
-    2) GPU, en serie y por lotes, para las fotos que Real-ESRGAN debe ampliar.
+    `target` (clave de UPSCALE_TARGETS): resolución final; por defecto 4K con
+    tope ×4. Las fotos que ya alcanzan la resolución se copian sin cambios.
+    El programa se ejecuta por lotes (una vez cada REALESRGAN_CHUNK fotos).
     """
     if target not in UPSCALE_TARGETS:
         print(f"  ✗ Resolución desconocida: {target}")
         return
-    if mode != "realesrgan" and not _ensure_cv2():
-        return
-    if not _NUMPY:
-        print("  ✗ Requiere numpy.")
-        return
-
     source = source.expanduser().resolve()
     output = output.expanduser().resolve()
     if not _validate_source_output(source, output):
         return
-
-    esrgan = None
-    if mode == "realesrgan":
-        esrgan = find_realesrgan()
-        if not esrgan:
-            print("  ✗ No se encontró realesrgan-ncnn-vulkan.")
-            print("    Descárgalo de https://github.com/xinntao/Real-ESRGAN/releases")
-            print(f"    y descomprímelo en {SCRIPT_DIR / 'realesrgan'}")
-            return
-    elif mode in ("auto", "diagnose"):
-        esrgan = find_realesrgan()   # opcional: solo para lo que no llega al objetivo
-    elif mode != "hdr":
-        print(f"  ✗ Modo desconocido: {mode}")
+    esrgan = find_realesrgan()
+    if not esrgan:
+        print("  ✗ No se encontró realesrgan-ncnn-vulkan.")
+        print("    Descárgalo de https://github.com/xinntao/Real-ESRGAN/releases")
+        print(f"    y descomprímelo en {SCRIPT_DIR / 'realesrgan'}")
         return
 
     images = find_images(source, exclude=output)
     if not images:
         print("  No se encontraron imágenes.")
         return
-
     _prepare_output_dir(output)
-    adaptive = mode in ("auto", "diagnose")
-    diagnose_only = mode == "diagnose"
-    verb = "a analizar" if diagnose_only else "a procesar"
-    print(f"  {len(images)} imágenes {verb}")
-    if esrgan:
-        print(f"  Resolución final: {UPSCALE_TARGETS[target]['label']}")
-    print()
+    print(f"  {len(images)} imágenes | resolución final: {UPSCALE_TARGETS[target]['label']}\n")
     suffix = UPSCALE_TARGETS[target]["suffix"]
 
-    # Destinos (calculados en el proceso principal: sin carreras de nombres)
-    jobs = []
+    ok = errors = metadata_warnings = already_big = 0
+    error_msgs = []
+    pending = []                       # (src, dst, tamaño visible)
+    t0 = time.time()
+
+    # Fase 1: decidir qué se amplía (solo lee cabeceras, rápido)
     for img_path in images:
         try:
             rel = img_path.relative_to(source)
         except ValueError:
             rel = Path(img_path.name)
         plain = output / rel
-        dst = plain.with_stem(plain.stem + suffix) if mode == "realesrgan" else plain
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        jobs.append({"src": img_path, "dst": _unique_path(dst), "plain": plain,
-                     "mode": mode, "target": target, "esrgan": esrgan, "hdr": hdr})
-
-    ok = errors = metadata_warnings = already_big = lowres_without_esrgan = 0
-    report_rows, error_msgs = [], []
-    action_counts = defaultdict(int)
-    esrgan_jobs = []        # (job, análisis | None)
-    t0 = time.time()
-
-    def record(res):
-        nonlocal ok, errors, metadata_warnings, lowres_without_esrgan
-        if res["status"] == "error":
+        plain.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            w, h = _oriented_size(img_path)
+        except Exception as e:
             errors += 1
-            error_msgs.append(res["error"])
-            return
-        ok += 1
-        if not res["meta_ok"]:
-            metadata_warnings += 1
-        if res["row"]:
-            report_rows.append(res["row"])
-            a = res["analysis"]
-            if a and a.get("needs_upscale") and not esrgan:
-                lowres_without_esrgan += 1
-            for act in res["actions"]:
-                action_counts[act.split(" (")[0].split(" ×")[0]] += 1
+            error_msgs.append(f"{img_path.name}: {e}")
+            continue
+        if upscale_factor(w, h, target) <= 1.0:
+            # Ya alcanza la resolución pedida: copia exacta, sin ampliar
+            shutil.copy2(str(img_path), str(_unique_path(plain)))
+            already_big += 1
+            ok += 1
+        else:
+            pending.append((img_path, _unique_path(plain.with_stem(plain.stem + suffix)), (w, h)))
 
-    # ── Fase 1: CPU ────────────────────────────────
-    if mode == "realesrgan":
-        for job in jobs:
-            try:
-                w, h = _oriented_size(job["src"])
-            except Exception as e:
-                record({"status": "error", "error": f"{job['src'].name}: {e}"})
-                continue
-            if upscale_factor(w, h, target) <= 1.0:
-                # Ya alcanza la resolución pedida: copia exacta, sin ampliar
-                shutil.copy2(str(job["src"]), str(_unique_path(job["plain"])))
-                already_big += 1
-                ok += 1
-            else:
-                esrgan_jobs.append((job, None))
-    else:
-        label = "Analizando" if diagnose_only else "Procesando"
-        for i, res in parallel_map(_enhance_task, jobs, label, workers=workers,
-                                   describe=lambda j: j["src"].name):
-            if res["status"] == "esrgan":
-                esrgan_jobs.append((jobs[i], res["analysis"]))
-            else:
-                record(res)
-
-    # ── Fase 2: GPU (Real-ESRGAN por lotes) ─────────
-    if esrgan_jobs:
-        print(f"\n  Real-ESRGAN: {len(esrgan_jobs)} foto(s) a ampliar")
-        progress = Progress(len(esrgan_jobs), "Real-ESRGAN")
-        sizes = []
-        for job, analysis in esrgan_jobs:
-            if analysis:
-                sizes.append((analysis["width"], analysis["height"]))
-            else:
-                try:
-                    sizes.append(_oriented_size(job["src"]))
-                except Exception:
-                    sizes.append((1, 1))
+    # Fase 2: Real-ESRGAN por lotes
+    if pending:
+        progress = Progress(len(pending), "Real-ESRGAN")
         done_before = 0
-        for chunk in _esrgan_chunks(esrgan_jobs, sizes):
+        for chunk in _esrgan_chunks(pending, [p[2] for p in pending]):
             loaded, scales, valid = [], [], []
-            for job, analysis in chunk:
+            for src, dst, _ in chunk:
                 try:
-                    img = _load_oriented_rgb(job["src"])
+                    img = _load_oriented_rgb(src)
                 except Exception as e:
-                    record({"status": "error", "error": f"{job['src'].name}: {e}"})
+                    errors += 1
+                    error_msgs.append(f"{src.name}: {e}")
                     continue
                 loaded.append(img)
                 scales.append(upscale_factor(img.width, img.height, target))
-                valid.append((job, analysis))
+                valid.append((src, dst))
 
-            def on_progress(finished, frac, base=done_before, chunk_jobs=valid):
-                current = chunk_jobs[min(finished, len(chunk_jobs) - 1)][0]["src"].name
+            def on_progress(finished, frac, base=done_before, names=valid):
+                current = names[min(finished, len(names) - 1)][0].name
                 progress.update(base + finished, current, sub=frac)
 
+            ups = []
             if valid:
-                progress.update(done_before, valid[0][0]["src"].name, force=True)
+                progress.update(done_before, valid[0][0].name, force=True)
                 ups = realesrgan_batch(loaded, esrgan, scales, on_progress)
-            else:
-                ups = []
-            for (job, analysis), img, up in zip(valid, loaded, ups):
-                res = {"src": job["src"], "status": "ok", "row": None,
-                       "analysis": None, "actions": [], "meta_ok": True}
+            for (src, dst), up in zip(valid, ups):
                 try:
                     if isinstance(up, Exception):
                         raise up
-                    if analysis is not None:          # modo auto: resto de ajustes
-                        arr, analysis, actions = enhance_adaptive(
-                            _pil_to_bgr(img), esrgan, target=target,
-                            analysis=analysis, upscaled=_pil_to_bgr(up), hdr=hdr)
-                        up = _bgr_to_pil(arr)
-                        res.update(analysis=analysis, actions=actions,
-                                   row=_auto_report_row(job["src"], analysis, actions))
-                    written, meta_ok = _save_pil(up, job["dst"], job["src"])
+                    written, meta_ok = _save_pil(up, dst, src)
                     if not written:
-                        raise OSError(f"no se pudo escribir {job['dst'].name}")
-                    res["meta_ok"] = meta_ok
+                        raise OSError(f"no se pudo escribir {dst.name}")
+                    ok += 1
+                    metadata_warnings += not meta_ok
                 except Exception as e:
-                    res.update(status="error", error=f"{job['src'].name}: {e}")
-                record(res)
+                    errors += 1
+                    error_msgs.append(f"{src.name}: {e}")
             done_before += len(chunk)
             progress.update(done_before, force=True)
         progress.finish()
 
-    # ── Resumen ──────────────────────────────────────
-    elapsed = time.time() - t0
-    done = "analizadas" if diagnose_only else "mejoradas"
-    print(f"\n  ✓ {ok} {done} | {errors} errores | {_fmt_duration(elapsed)}")
+    print(f"\n  ✓ {ok} procesadas | {errors} errores | {_fmt_duration(time.time() - t0)}")
     for msg in error_msgs[:10]:
         print(f"    ⚠ {msg}")
     if len(error_msgs) > 10:
@@ -2310,31 +1584,6 @@ def run_enhance(source: Path, output: Path, mode: str,
     if already_big:
         print(f"  ℹ {already_big} foto(s) ya tenían {UPSCALE_TARGETS[target]['label']} "
               "o más: copiadas sin cambios")
-
-    if adaptive and report_rows:
-        report_rows.sort(key=lambda r: r["archivo"])
-        untouched = sum(1 for r in report_rows if r["acciones"].startswith("ninguna"))
-        print("\n  Diagnóstico:" if diagnose_only else "\n  Correcciones aplicadas:")
-        for name, count in sorted(action_counts.items(), key=lambda x: -x[1]):
-            name = name.split(":")[0]
-            print(f"    {count:5d}  {name}")
-        print(f"    {untouched:5d}  sin cambios (ya estaban bien)")
-        if lowres_without_esrgan:
-            print(f"\n  ⚠ {lowres_without_esrgan} foto(s) por debajo de "
-                  f"{UPSCALE_TARGETS[target]['label']}.")
-            print("    Los ajustes de tono no recuperan detalle que no existe.")
-            print("    Para mejorarlas de verdad instala Real-ESRGAN:")
-            print("    https://github.com/xinntao/Real-ESRGAN/releases")
-        report = output / "mejora_reporte.csv"
-        try:
-            with open(report, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=list(report_rows[0]))
-                writer.writeheader()
-                writer.writerows(report_rows)
-            print(f"\n  ✓ Reporte por foto: {report}")
-        except OSError as e:
-            print(f"  ⚠ No se pudo escribir el reporte: {e}")
-
     if metadata_warnings:
         print(f"  ⚠ {metadata_warnings} archivo(s) sin metadatos restaurados (EXIF/ICC/DPI)")
     print(f"  ✓ Resultado en: {output}")
@@ -2704,64 +1953,21 @@ def menu_compare():
 
 
 def menu_enhance():
-    banner("MEJORAR FOTOS")
-    if not _CV2:
-        print("  ✗ Requiere OpenCV. Instala:")
-        print("    pip install opencv-contrib-python==4.10.0.84")
+    banner("AMPLIAR FOTOS (Real-ESRGAN)")
+    if not find_realesrgan():
+        print("  ✗ Real-ESRGAN no instalado. Descarga realesrgan-ncnn-vulkan de")
+        print("    https://github.com/xinntao/Real-ESRGAN/releases")
+        print(f"    y descomprímelo en {SCRIPT_DIR / 'realesrgan'}")
         return
-    esrgan = find_realesrgan()
-
     source = ask_folder("Carpeta de fotos")
     if not source:
         return
     output = ask_folder("Carpeta de salida (Enter = auto)", must_exist=False)
     if not output:
         output = source / "MEJORADAS"
-
-    es_tag = "" if esrgan else " (Real-ESRGAN no instalado)"
-    print(f"""
-  Modos de mejora:
-    1. Automático: analiza cada foto y corrige solo lo necesario
-       (amplía hasta {UPSCALE_TARGETS[AUTO_TARGET]['label']}, aclara fotos oscuras con brillo automático){es_tag}
-    2. Real-ESRGAN: ampliar hasta {UPSCALE_TARGETS[AUTO_TARGET]['label']} (máx. ×4){es_tag}
-    3. HDR: aclarar sombras sin quemar luces (a todas)
-    4. Solo diagnosticar (no modifica nada, genera reporte)
-""")
-    opt = ask("Modo", "1")
-    mode = {"1": "auto", "2": "realesrgan", "3": "hdr", "4": "diagnose"}.get(opt)
-    if not mode:
-        print("  Opción no válida.")
-        return
-
-    if mode == "realesrgan" and not esrgan:
-        print("  ✗ Real-ESRGAN no instalado. Descarga realesrgan-ncnn-vulkan de")
-        print("    https://github.com/xinntao/Real-ESRGAN/releases")
-        print(f"    y descomprímelo en {SCRIPT_DIR / 'realesrgan'}")
-        return
-
-    # Automático, Real-ESRGAN y diagnóstico: sin preguntas, al máximo útil.
-    hdr = AUTO_HDR
-    if mode == "hdr":
-        hdr = ask_hdr_level()
-        if not hdr:
-            return
-
-    run_enhance(source, output, mode, target=AUTO_TARGET, hdr=hdr)
-
-
-def ask_hdr_level() -> str | None:
-    """Pregunta cuánto aclarar las sombras (HDR)."""
-    keys = list(HDR_LEVELS)
-    print("\n  Intensidad del HDR (cuánto aclarar las fotos oscuras):")
-    labels = {"suave": "Suave", "normal": "Normal (recomendado)", "fuerte": "Fuerte (aspecto HDR marcado)"}
-    for n, key in enumerate(keys, 1):
-        print(f"    {n}. {labels.get(key, key)}")
-    opt = ask("Intensidad", str(keys.index(DEFAULT_HDR) + 1))
-    try:
-        return keys[int(opt) - 1]
-    except (ValueError, IndexError):
-        print("  Opción no válida.")
-        return None
+    print(f"  Amplía hasta {UPSCALE_TARGETS[AUTO_TARGET]['label']} (máx. ×4); "
+          "las que ya lo son se copian sin cambios.")
+    run_enhance(source, output, target=AUTO_TARGET)
 
 
 def menu_blur():
@@ -2840,7 +2046,7 @@ def main_menu():
 ║                                              ║
 ║  1. Deduplicar fotos                         ║
 ║  2. Comparar dos carpetas                    ║
-║  3. Mejorar fotos (IA / HDR)                 ║
+║  3. Ampliar fotos (Real-ESRGAN)              ║
 ║  4. Detectar fotos borrosas                  ║
 ║  5. Comprimir / Convertir                    ║
 ║                                              ║
