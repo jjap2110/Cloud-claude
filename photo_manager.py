@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Photo Manager CLI v1.14.0
+Photo Manager CLI v1.15.0
 Herramienta de gestión de fotos.
 
 Funcionalidades:
@@ -14,7 +14,7 @@ Funcionalidades:
        - HDR: aclara sombras sin quemar luces (suave / normal / fuerte)
        - Diagnóstico: reporte de lo que haría el modo automático
   4. Detectar fotos borrosas (varianza del Laplaciano, resolución normalizada)
-  5. Comprimir / Convertir (HEIF, WebP, JPEG)
+  5. Comprimir / Convertir (HEIF, WebP, JPEG; recomprime HEIC; reduce resolución)
 
 Dependencias:
   pip install Pillow imagehash pillow-heif opencv-contrib-python==4.10.0.84
@@ -84,7 +84,7 @@ except ImportError:
 # CONSTANTES
 # ══════════════════════════════════════════════════
 
-VERSION = "1.14.0"
+VERSION = "1.15.0"
 
 # [FIX #12] Separar formatos soportados por Pillow vs RAW
 PILLOW_EXTENSIONS = {
@@ -2485,34 +2485,125 @@ def run_blur_detect(source: Path, threshold: float = 100.0,
 # ══════════════════════════════════════════════════
 
 
+# Resolución máxima al comprimir: límite del LADO LARGO (una foto 4:3 del
+# iPhone a "Full HD" queda en 1920×1440). WhatsApp envía 1600 px en calidad
+# estándar y 4096 px en HD.
+COMPRESS_MAX_SIDES = {
+    "original": ("Original (sin cambio)", None),
+    "4k": ("4K (lado largo 3840 px)", 3840),
+    "2k": ("2K (lado largo 2560 px)", 2560),
+    "fullhd": ("Full HD (lado largo 1920 px)", 1920),
+    "whatsapp": ("WhatsApp estándar (lado largo 1600 px)", 1600),
+}
+COMPRESS_DEFAULT_QUALITY = 75
+
+
+def _compress_task(job: dict) -> dict:
+    """Comprime una foto (proceso aparte). Nunca lanza excepciones.
+
+    status: ok | kept (el resultado no era más pequeño: se conserva el
+    original) | copied (animada/multipágina: copia sin tocar) | error
+    """
+    src, dst, fmt = job["src"], job["dst"], job["fmt"]
+    res = {"src": src, "status": "ok", "out": None, "resized": False,
+           "orig_size": 0, "new_size": 0, "error": None}
+    try:
+        res["orig_size"] = src.stat().st_size
+        with Image.open(src) as opened:
+            if getattr(opened, "n_frames", 1) > 1:
+                out = _unique_path(dst.with_suffix(src.suffix))
+                shutil.copy2(str(src), str(out))
+                res.update(status="copied", out=out, new_size=out.stat().st_size)
+                return res
+            img = opened.copy()
+            info = dict(opened.info)
+        exif, icc, dpi = info.get("exif"), info.get("icc_profile"), info.get("dpi")
+        has_alpha = img.mode in ("RGBA", "LA", "PA") or (
+            img.mode == "P" and "transparency" in info)
+
+        # Reducir por el lado largo. No se aplica la orientación EXIF: los
+        # píxeles se escalan tal cual y la etiqueta de orientación sigue valiendo.
+        max_side = job["max_side"]
+        if max_side and max(img.size) > max_side:
+            f = max_side / max(img.size)
+            size = (max(1, round(img.width * f)), max(1, round(img.height * f)))
+            if img.mode not in ("RGB", "RGBA", "L"):
+                img = img.convert("RGBA" if has_alpha else "RGB")
+            img = img.resize(size, Image.Resampling.LANCZOS)
+            res["resized"] = True
+
+        kw = {"quality": job["quality"]}
+        if exif:
+            kw["exif"] = exif
+        if icc:
+            kw["icc_profile"] = icc
+        if fmt == "heif":
+            img = img.convert("RGBA" if has_alpha else "RGB")
+            kw["format"] = "HEIF"
+        elif fmt == "webp":
+            if img.mode not in ("RGB", "RGBA"):
+                img = img.convert("RGBA" if has_alpha else "RGB")
+            kw.update({"format": "WEBP", "method": 4})
+        else:
+            # JPEG no admite alfa; componer explícitamente sobre blanco.
+            if has_alpha:
+                rgba = img.convert("RGBA")
+                background = Image.new("RGB", rgba.size, (255, 255, 255))
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                img = background
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+            kw.update({"format": "JPEG", "optimize": True})
+            if dpi:
+                kw["dpi"] = dpi
+        img.save(str(dst), **kw)
+
+        new_size = dst.stat().st_size
+        if not res["resized"] and new_size >= res["orig_size"]:
+            # Recomprimir no ahorró nada: conservar el original intacto
+            dst.unlink()
+            out = _unique_path(dst.with_suffix(src.suffix))
+            shutil.copy2(str(src), str(out))
+            res.update(status="kept", out=out, new_size=out.stat().st_size)
+            return res
+        res.update(out=dst, new_size=new_size)
+    except Exception as e:
+        try:
+            dst.unlink(missing_ok=True)
+        except OSError:
+            pass
+        res.update(status="error", error=f"{src.name}: {e}")
+    return res
+
+
 def run_compress(source: Path, output: Path, fmt: str = "heif",
-                 quality: int = 85, keep_structure: bool = True):
-    """Comprime/convierte imágenes a otro formato."""
+                 quality: int = COMPRESS_DEFAULT_QUALITY, keep_structure: bool = True,
+                 max_side: int | None = None, workers: int | None = None):
+    """Comprime/convierte imágenes (también las que ya son HEIF/HEIC).
+
+    max_side: límite del lado largo en píxeles (None = sin cambio).
+    Nunca deja un archivo más grande que el original si no se redujo la
+    resolución: en ese caso conserva el original.
+    """
     source = source.expanduser().resolve()
     output = output.expanduser().resolve()
     if not _validate_source_output(source, output):
+        return
+    if fmt == "heif" and not _HEIF:
+        print("  ✗ HEIF no disponible. Instala: pip install pillow-heif")
         return
     images = find_images(source, exclude=output)
     if not images:
         print("  No se encontraron imágenes.")
         return
 
-    if fmt == "heif" and not _HEIF:
-        print("  ✗ HEIF no disponible. Instala: pip install pillow-heif")
-        return
-
     _prepare_output_dir(output)
-    print(f"  {len(images)} imágenes → {fmt.upper()} (q={quality})\n")
+    size_txt = f", lado largo ≤ {max_side} px" if max_side else ""
+    print(f"  {len(images)} imágenes → {fmt.upper()} (calidad {quality}{size_txt})\n")
 
-    orig_total, conv_total = 0, 0
-    ok, errors, heic_copied = 0, 0, 0
-
-    ext_map = {"heif": ".heif", "webp": ".webp", "jpeg": ".jpg"}
-    target_ext = ext_map.get(fmt, ".jpg")
-
-    progress = Progress(len(images), "Convirtiendo")
-    for i, img_path in enumerate(images, 1):
-        progress.update(i - 1, img_path.name)
+    target_ext = {"heif": ".heif", "webp": ".webp", "jpeg": ".jpg"}.get(fmt, ".jpg")
+    jobs, reserved = [], set()
+    for img_path in images:
         if keep_structure:
             try:
                 rel = img_path.relative_to(source)
@@ -2521,69 +2612,45 @@ def run_compress(source: Path, output: Path, fmt: str = "heif",
             dst = output / rel.with_suffix(target_ext)
         else:
             dst = output / (img_path.stem + target_ext)
-
         dst.parent.mkdir(parents=True, exist_ok=True)
-        dst = _unique_path(dst)
+        # foto.jpg y foto.png irían ambas a foto.heif: reservar nombres
+        candidate, c = _unique_path(dst), 1
+        while candidate in reserved:
+            candidate = dst.with_name(f"{dst.stem}_{c}{dst.suffix}")
+            c += 1
+        reserved.add(candidate)
+        jobs.append({"src": img_path, "dst": candidate, "fmt": fmt,
+                     "quality": quality, "max_side": max_side})
 
-        orig_size = img_path.stat().st_size
-        orig_total += orig_size
-
-        try:
-            if fmt == "heif":
-                actual, reason = _convert_heif(img_path, dst, quality)
-                if reason == "heic":
-                    heic_copied += 1
-                if not actual:
-                    errors += 1
-                    continue
-                dst = actual  # usar path real (puede diferir si hubo fallback)
-            else:
-                with Image.open(img_path) as opened:
-                    if getattr(opened, "n_frames", 1) > 1:
-                        raise ValueError("imagen animada/multipágina: omitida para no perder fotogramas")
-                    img = opened.copy()
-                    exif = opened.info.get("exif")
-                    icc = opened.info.get("icc_profile")
-                    dpi = opened.info.get("dpi")
-                    kw = {"quality": quality}
-                    if exif:
-                        kw["exif"] = exif
-                    if icc:
-                        kw["icc_profile"] = icc
-                    if dpi:
-                        kw["dpi"] = dpi
-                    if fmt == "webp":
-                        # WebP admite transparencia: conservar RGBA/LA.
-                        if img.mode not in ("RGB", "RGBA"):
-                            img = img.convert("RGBA" if "transparency" in opened.info else "RGB")
-                        kw.update({"format": "WEBP", "method": 4})
-                    else:
-                        # JPEG no admite alfa; componer explícitamente sobre blanco.
-                        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in opened.info):
-                            rgba = img.convert("RGBA")
-                            background = Image.new("RGB", rgba.size, (255, 255, 255))
-                            background.paste(rgba, mask=rgba.getchannel("A"))
-                            img = background
-                        elif img.mode != "RGB":
-                            img = img.convert("RGB")
-                        kw.update({"format": "JPEG", "optimize": True})
-                    img.save(str(dst), **kw)
-
-            conv_total += dst.stat().st_size
-            ok += 1
-        except Exception as e:
-            print(f"  ⚠ {img_path.name}: {e}")
+    orig_total = new_total = 0
+    ok = errors = kept = copied = resized = 0
+    error_msgs = []
+    for _, res in parallel_map(_compress_task, jobs, "Comprimiendo", workers=workers,
+                               describe=lambda j: j["src"].name):
+        if res["status"] == "error":
             errors += 1
+            error_msgs.append(res["error"])
+            continue
+        ok += 1
+        orig_total += res["orig_size"]
+        new_total += res["new_size"]
+        kept += res["status"] == "kept"
+        copied += res["status"] == "copied"
+        resized += res["resized"]
 
-
-    progress.finish()
     print(f"\n  Original:  {format_size(orig_total)}")
-    print(f"  {fmt.upper()}:     {format_size(conv_total)}")
+    print(f"  Resultado: {format_size(new_total)}")
     if orig_total:
-        print(f"  Reducción: {(1 - conv_total / orig_total) * 100:.0f}%")
-    print(f"  ✓ {ok} convertidas | {errors} errores")
-    if heic_copied:
-        print(f"  ℹ {heic_copied} archivo(s) HEIC copiado(s) sin recomprimir (ya son HEIF)")
+        print(f"  Reducción: {(1 - new_total / orig_total) * 100:.0f}%")
+    print(f"  ✓ {ok} procesadas | {errors} errores")
+    for msg in error_msgs[:10]:
+        print(f"    ⚠ {msg}")
+    if resized:
+        print(f"  ℹ {resized} foto(s) reducida(s) a lado largo {max_side} px")
+    if kept:
+        print(f"  ℹ {kept} foto(s) conservada(s) tal cual: recomprimir no las hacía más pequeñas")
+    if copied:
+        print(f"  ℹ {copied} archivo(s) animado(s)/multipágina copiado(s) sin cambios")
     print(f"  ✓ Resultado en: {output}")
 
 
@@ -2723,24 +2790,35 @@ def menu_compress():
     if not output:
         output = source / "COMPRIMIDAS"
 
-    heif_tag = " (recomendado)" if _HEIF else " (no disponible)"
+    heif_tag = " (recomendado; también recomprime HEIC/HEIF)" if _HEIF else " (no disponible)"
     print(f"""
   Formato:
-    1. HEIF{heif_tag} — ~50% reducción
-    2. WebP — ~30% reducción
-    3. JPEG optimizado — ~15% reducción
+    1. HEIF{heif_tag}
+    2. WebP
+    3. JPEG optimizado
 """)
     opt = ask("Formato", "1" if _HEIF else "2")
-    fmt_map = {"1": "heif", "2": "webp", "3": "jpeg"}
-    fmt = fmt_map.get(opt)
+    fmt = {"1": "heif", "2": "webp", "3": "jpeg"}.get(opt)
     if not fmt:
         print("  Opción no válida.")
         return
     if fmt == "heif" and not _HEIF:
         print("  ✗ HEIF no disponible. Instala: pip install pillow-heif")
         return
-    quality = ask_int("Calidad (85=recomendado)", 85, min_val=1, max_val=100)
-    run_compress(source, output, fmt=fmt, quality=quality)
+    quality = ask_int(f"Calidad ({COMPRESS_DEFAULT_QUALITY}=recomendado)",
+                      COMPRESS_DEFAULT_QUALITY, min_val=1, max_val=100)
+
+    keys = list(COMPRESS_MAX_SIDES)
+    print("\n  Resolución máxima (reducir es irreversible):")
+    for n, key in enumerate(keys, 1):
+        print(f"    {n}. {COMPRESS_MAX_SIDES[key][0]}")
+    opt = ask("Resolución", "1")
+    try:
+        max_side = COMPRESS_MAX_SIDES[keys[int(opt) - 1]][1]
+    except (ValueError, IndexError):
+        print("  Opción no válida.")
+        return
+    run_compress(source, output, fmt=fmt, quality=quality, max_side=max_side)
 
 
 def main_menu():

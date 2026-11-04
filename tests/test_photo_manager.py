@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from PIL import Image, ImageCms, ImageFilter
+from PIL import Image, ImageCms, ImageFilter, ImageOps
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import photo_manager as pm  # noqa: E402
@@ -887,3 +887,77 @@ def test_classic_chain_keeps_more_contrast_than_hdr():
 def test_auto_uses_hdr_when_highlights_already_high():
     _, _, actions = pm.enhance_adaptive(window_scene())
     assert any(x.startswith("HDR") for x in actions)
+
+
+# ──────────────────────────────────────────────────────────────
+# Comprimir: recomprimir HEIF, resolución máxima, nunca más grande
+# ──────────────────────────────────────────────────────────────
+
+def _textured(w, h, seed=0):
+    """Imagen con textura fina (comprime como una foto real, no como un dibujo)."""
+    rng = np.random.default_rng(seed)
+    base = photo(w, h, seed=seed).astype(np.int16)
+    return np.clip(base + rng.normal(0, 6, base.shape), 0, 255).astype(np.uint8)
+
+
+@pytest.mark.skipif(not pm._HEIF, reason="pillow-heif no instalado")
+def test_compress_recompresses_existing_heif(tmp_path):
+    src, out = tmp_path / "src", tmp_path / "out"
+    src.mkdir()
+    Image.fromarray(_textured(1200, 900)).save(
+        src / "iphone.heic", format="HEIF", quality=95,
+        exif=exif_bytes(original="2019:05:05 12:00:00"))
+    pm.run_compress(src, out, fmt="heif", quality=60)
+    res = out / "iphone.heif"
+    assert res.exists()
+    assert res.stat().st_size < (src / "iphone.heic").stat().st_size * 0.8
+    with Image.open(res) as r:
+        assert r.getexif().get_ifd(EXIF_IFD).get(36867) == "2019:05:05 12:00:00"
+
+
+@pytest.mark.skipif(not pm._HEIF, reason="pillow-heif no instalado")
+@pytest.mark.parametrize("key, expected", [("fullhd", (1920, 1440)), ("whatsapp", (1600, 1200)),
+                                           ("4k", (3840, 2880)), ("original", (4032, 3024))])
+def test_compress_max_side(tmp_path, key, expected):
+    src, out = tmp_path / "src", tmp_path / "out"
+    src.mkdir()
+    Image.fromarray(_textured(4032, 3024)).save(src / "f.jpg", quality=95)
+    pm.run_compress(src, out, fmt="heif", quality=75, max_side=pm.COMPRESS_MAX_SIDES[key][1])
+    found = list(out.glob("f.*"))
+    assert len(found) == 1
+    with Image.open(found[0]) as r:
+        assert r.size == expected
+
+
+@pytest.mark.skipif(not pm._HEIF, reason="pillow-heif no instalado")
+def test_compress_portrait_keeps_orientation_tag(tmp_path):
+    src, out = tmp_path / "src", tmp_path / "out"
+    src.mkdir()
+    # Almacenada apaisada 4032×3024 con orientación 6: se ve vertical
+    Image.fromarray(_textured(4032, 3024)).save(src / "v.jpg", quality=95,
+                                                exif=exif_bytes(orientation=6))
+    pm.run_compress(src, out, fmt="heif", max_side=1920)
+    with Image.open(out / "v.heif") as r:
+        shown = ImageOps.exif_transpose(r)
+        assert shown.size == (1440, 1920)
+
+
+def test_compress_never_larger_than_original(tmp_path):
+    src, out = tmp_path / "src", tmp_path / "out"
+    src.mkdir()
+    Image.fromarray(_textured(800, 600)).save(src / "ya_comprimida.jpg", quality=40)
+    pm.run_compress(src, out, fmt="jpeg", quality=98)
+    files = list(out.glob("ya_comprimida*"))
+    assert len(files) == 1
+    assert files[0].read_bytes() == (src / "ya_comprimida.jpg").read_bytes()
+
+
+def test_compress_same_stem_different_formats_do_not_collide(tmp_path):
+    src, out = tmp_path / "src", tmp_path / "out"
+    src.mkdir()
+    Image.fromarray(_textured(400, 300, seed=1)).save(src / "foto.jpg", quality=95)
+    Image.fromarray(_textured(400, 300, seed=2)).save(src / "foto.png")
+    Image.fromarray(_textured(400, 300, seed=3)).save(src / "foto.bmp")
+    Image.fromarray(_textured(400, 300, seed=4)).save(src / "foto.tif")
+    pm.run_compress(src, out, fmt="jpeg", quality=70)
+    assert len(list(out.glob("foto*"))) == 4
