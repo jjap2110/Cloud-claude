@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Photo Manager CLI v1.12.0
+Photo Manager CLI v1.13.0
 Herramienta de gestión de fotos.
 
 Funcionalidades:
@@ -84,7 +84,7 @@ except ImportError:
 # CONSTANTES
 # ══════════════════════════════════════════════════
 
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 
 # [FIX #12] Separar formatos soportados por Pillow vs RAW
 PILLOW_EXTENSIONS = {
@@ -1736,6 +1736,96 @@ def enhance_hdr(bgr, level: str = DEFAULT_HDR):
     return cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
+# Brillo medio objetivo tras aclarar, según intensidad (LAB 0-255; ~118 = medio)
+HDR_TARGET_MEAN = {"suave": 100, "normal": 110, "fuerte": 120}
+# Cuánto del negro original se recupera tras el HDR (0 = nada, foto lavada;
+# 1 = todo, deshace parte del aclarado y destapa grano en zonas oscuras).
+# Elegido sobre una foto real (selfie nocturno de WhatsApp) y una escena
+# sintética de interior con ventana.
+HDR_BLACK_RESTORE = 0.6
+HDR_DEEP_SHADOW = 45   # luminancia original por debajo: limpieza fuerte tras aclarar
+
+
+def _restore_black_point(bgr, black: float, knee: float = 40.0):
+    """Devuelve el negro (percentil 0,5) a `black` solo en los tonos más bajos.
+
+    El HDR levanta también los negros y la foto queda con neblina. Una
+    curva de "pie": baja el negro hasta `black` y el efecto se desvanece
+    hasta desaparecer `knee` niveles más arriba, así que los tonos medios
+    (lo que el HDR aclaró) no se tocan.
+    """
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    lo = float(np.percentile(lab[:, :, 0], 0.5))
+    if lo <= black + 1:
+        return bgr
+    x = np.arange(256, dtype=np.float32)
+    offset = (lo - black) * np.clip(1 - (x - lo) / knee, 0, 1)
+    lut = np.where(x <= lo, x * black / max(lo, 1), x - offset)
+    lab[:, :, 0] = cv2.LUT(lab[:, :, 0], np.clip(lut, 0, 255).astype(np.uint8))
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+def _restore_saturation(before, after, amount: float = 0.7, max_gain: float = 1.8):
+    """Aumenta el color en proporción al aclarado de cada zona.
+
+    Al subir solo la luminancia, los colores conservan su intensidad
+    absoluta y se ven grises (piel apagada). El factor sale de un mapa
+    suavizado para no amplificar el ruido de color.
+    """
+    lb = cv2.cvtColor(before, cv2.COLOR_BGR2LAB).astype(np.float32)
+    la = cv2.cvtColor(after, cv2.COLOR_BGR2LAB).astype(np.float32)
+    gain = cv2.GaussianBlur((la[:, :, 0] + 8) / (lb[:, :, 0] + 8), (0, 0), 5)
+    gain = np.clip(1 + amount * (gain - 1), 1.0, max_gain)
+    for c in (1, 2):
+        la[:, :, c] = 128 + (la[:, :, c] - 128) * gain
+    return cv2.cvtColor(np.clip(la, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
+def brighten_dark(bgr, level: str = DEFAULT_HDR) -> tuple:
+    """Aclara una foto oscura: HDR + punto negro + brillo + color + limpieza.
+
+    1. HDR (fusión de exposiciones): abre sombras sin quemar luces.
+    2. Recupera parte del negro original (HDR_BLACK_RESTORE): quita la
+       neblina sin deshacer el aclarado de los tonos medios.
+    3. Brillo global hacia HDR_TARGET_MEAN[level] si aún queda oscura
+       (las fotos muy subexpuestas no llegan solo con el HDR).
+    4. Saturación proporcional al aclarado: evita la piel gris.
+    5. Limpieza proporcional al aclarado: el ruido y las manchas de color
+       que estaban ocultos en la oscuridad se hacen visibles al aclarar
+       (el ruido medido ANTES de aclarar no lo refleja). Fuerte en color,
+       suave en luminancia, para conservar el detalle; y fuerte en todo
+       donde el original era casi negro.
+    Devuelve (imagen, aclarado medio ×, h de limpieza o 0).
+    """
+    lum_before = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[:, :, 0]
+    black = float(np.percentile(lum_before, 0.5))
+    out = enhance_hdr(bgr, level)
+    lifted_black = float(np.percentile(cv2.cvtColor(out, cv2.COLOR_BGR2LAB)[:, :, 0], 0.5))
+    out = _restore_black_point(
+        out, lifted_black - HDR_BLACK_RESTORE * (lifted_black - black))
+    target = HDR_TARGET_MEAN[level]
+    mean = float(cv2.cvtColor(out, cv2.COLOR_BGR2LAB)[:, :, 0].mean())
+    if mean < target:
+        out = _gamma_toward(out, mean, target=target, amount=0.8)
+    out = _restore_saturation(bgr, out)
+
+    gain = (float(cv2.cvtColor(out, cv2.COLOR_BGR2LAB)[:, :, 0].mean()) + 8) / \
+           (float(lum_before.mean()) + 8)
+    h = 0
+    if gain >= 1.3:
+        h = int(np.clip(round(1 + 2.5 * (gain - 1)), 2, 6))
+        h_color = int(np.clip(round(4 + 8 * (gain - 1)), 4, 14))
+        out = cv2.fastNlMeansDenoisingColored(out, None, h, h_color, 7, 21)
+        # Lo que era casi negro se aclaró muchísimo más que el resto y queda
+        # con grano: limpieza fuerte solo ahí, con transición suave.
+        mask = np.clip((HDR_DEEP_SHADOW - lum_before.astype(np.float32)) / 30, 0, 1)
+        if mask.mean() > 0.03:
+            mask = cv2.GaussianBlur(mask, (0, 0), 6)[..., None]
+            strong = cv2.fastNlMeansDenoisingColored(out, None, 8, 12, 7, 21)
+            out = (mask * strong + (1 - mask) * out).astype(np.uint8)
+    return out, gain, h
+
+
 def _shadow_share(bgr) -> float:
     """Fracción de la foto en sombra (medida sobre una copia reducida)."""
     h, w = bgr.shape[:2]
@@ -1815,17 +1905,21 @@ def enhance_adaptive(bgr, esrgan: Path | None = None, dry_run: bool = False,
     mean = float(cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[:, :, 0].mean())
     shadows = _shadow_share(bgr)
     a["shadows"] = shadows
+    brightened = False
     if mean < AUTO_HDR_MEAN or shadows > AUTO_HDR_SHADOWS:
-        # HDR en vez de un aclarado global: abre sombras sin quemar luces
+        # HDR + punto negro + color + limpieza (ver brighten_dark)
         if not dry_run:
-            bgr = enhance_hdr(bgr, hdr)
-        actions.append(f"HDR {hdr}: aclarar sombras (brillo {mean:.0f}, "
+            bgr, gain, _ = brighten_dark(bgr, hdr)
+            a["brighten_gain"] = gain
+        actions.append(f"HDR {hdr}: aclarar (brillo {mean:.0f}, "
                        f"sombras {shadows * 100:.0f} %)")
+        brightened = True
     elif mean > AUTO_BRIGHT_MEAN:
         bgr = _gamma_toward(bgr, mean)
         actions.append(f"oscurecer (brillo {mean:.0f})")
 
-    if not upscaled and a["sharpness"] < AUTO_SOFT:
+    if not upscaled and not brightened and a["sharpness"] < AUTO_SOFT:
+        # No se enfoca tras aclarar: realzaría el grano que el aclarado destapa.
         # Enfoque suave si hay ruido o baja resolución: evita realzar artefactos
         amount = 0.3 if (a["noise"] > AUTO_NOISE_SIGMA or a["low_res"]) else 0.6
         bgr = enhance_sharpen(bgr, amount=amount)
@@ -1893,7 +1987,7 @@ def _enhance_task(job: dict) -> dict:
                 res["status"] = "copied"
                 return res
         else:                       # mode == "hdr"
-            arr = enhance_hdr(arr, job["hdr"])
+            arr, _, _ = brighten_dark(arr, job["hdr"])
         written, meta_ok = _save_pil(_bgr_to_pil(arr), dst, src)
         if not written:
             raise OSError(f"no se pudo escribir {dst.name}")

@@ -802,3 +802,52 @@ def test_auto_target_upscales_small_to_x4_but_not_large(tmp_path):
     _, a, actions = pm.enhance_adaptive(photo(4000, 3000), esrgan=exe,
                                         target=pm.AUTO_TARGET, dry_run=True)
     assert not any(x.startswith("super-resolución") for x in actions)
+
+
+# ──────────────────────────────────────────────────────────────
+# Fotos muy oscuras (selfie nocturno): aclarado completo
+# ──────────────────────────────────────────────────────────────
+
+def very_dark(seed=0):
+    """Foto muy subexpuesta con color (brillo ~50) y grano en las sombras."""
+    rng = np.random.default_rng(seed)
+    # Como una foto real: el negro no es 0 puro (sensor + compresión)
+    base = 8 + (photo(seed=seed) / 255.0) ** 3.0 * 200
+    base = base + rng.normal(0, 2.5, base.shape) * (base < 40)
+    return np.clip(base, 0, 255).astype(np.uint8)
+
+
+def _chroma(bgr):
+    import cv2
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(float)
+    return np.hypot(lab[..., 1] - 128, lab[..., 2] - 128).mean()
+
+
+def test_very_dark_photo_reaches_target_brightness():
+    img = very_dark()
+    assert _lum(img).mean() < 70
+    for level, target in pm.HDR_TARGET_MEAN.items():
+        out, gain, _ = pm.brighten_dark(img, level)
+        assert _lum(out).mean() >= target - 12, level
+        assert gain > 1.3
+
+
+def test_very_dark_keeps_color_and_depth():
+    img = very_dark()
+    out, _, _ = pm.brighten_dark(img, "fuerte")
+    assert _chroma(out) >= _chroma(img) * 0.95                 # no queda gris
+    lifted_black = np.percentile(_lum(pm.enhance_hdr(img, "fuerte")), 0.5)
+    assert np.percentile(_lum(out), 0.5) < lifted_black       # se quita neblina
+
+
+def test_black_point_restore_keeps_hdr_lift_in_window_scene():
+    img = window_scene()
+    half = img.shape[1] // 2
+    out, _, _ = pm.brighten_dark(img, "fuerte")
+    assert _lum(out)[:, :half - 100].mean() > _lum(img)[:, :half - 100].mean() + 25
+
+
+def test_auto_does_not_sharpen_after_brightening():
+    _, _, actions = pm.enhance_adaptive(very_dark())
+    assert any(a.startswith("HDR") for a in actions)
+    assert not any(a.startswith("enfocar") for a in actions)
