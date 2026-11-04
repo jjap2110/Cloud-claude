@@ -728,7 +728,7 @@ def test_auto_applies_hdr_to_slightly_dark_photo():
     img = ((photo() / 255.0) ** 2.0 * 255).astype(np.uint8)
     assert 90 < _lum(img).mean() < 110
     out, a, actions = pm.enhance_adaptive(img)
-    assert any(x.startswith("HDR") for x in actions)
+    assert any(x.startswith(("HDR", "aclarar")) for x in actions)
     assert _lum(out).mean() > _lum(img).mean() + 8
 
 
@@ -739,7 +739,7 @@ def test_auto_applies_hdr_to_window_scene():
 
 def test_auto_no_hdr_on_well_exposed_photo():
     _, _, actions = pm.enhance_adaptive(photo())
-    assert not any(x.startswith("HDR") for x in actions)
+    assert not any(x.startswith(("HDR", "aclarar")) for x in actions)
 
 
 def test_hdr_mode_writes_files(tmp_path):
@@ -784,7 +784,7 @@ def test_menu_auto_esrgan_diagnose_ask_nothing_and_use_max(opt, mode, monkeypatc
     assert len(asked) == 3                       # carpeta, salida, modo
     (args, kwargs), = calls
     assert args[2] == mode
-    assert kwargs["target"] == "4k" and kwargs["hdr"] == "fuerte"
+    assert kwargs["target"] == "4k" and kwargs["hdr"] == pm.AUTO_HDR
 
 
 @pytest.mark.parametrize("answer, level", [("1", "suave"), ("", "normal"), ("3", "fuerte")])
@@ -849,5 +849,41 @@ def test_black_point_restore_keeps_hdr_lift_in_window_scene():
 
 def test_auto_does_not_sharpen_after_brightening():
     _, _, actions = pm.enhance_adaptive(very_dark())
-    assert any(a.startswith("HDR") for a in actions)
+    assert any(a.startswith(("HDR", "aclarar")) for a in actions)
     assert not any(a.startswith("enfocar") for a in actions)
+
+
+# ──────────────────────────────────────────────────────────────
+# Aclarado clásico con brillo automático (v1.14)
+# ──────────────────────────────────────────────────────────────
+
+def test_auto_uses_classic_chain_for_very_dark_photo():
+    img = very_dark()
+    out, a, actions = pm.enhance_adaptive(img)
+    assert any(x.startswith("aclarar") for x in actions)
+    limit = max(pm.AUTO_HIGHLIGHT_P98, np.percentile(_lum(img), 98) + pm.AUTO_HIGHLIGHT_MARGIN)
+    assert np.percentile(_lum(out), 98) <= limit + 3          # luces respetadas
+    assert _lum(out).mean() > _lum(img).mean() + 30
+
+
+def test_choose_brightness_lower_when_highlights_are_high():
+    dark_low_highlights = (photo() * 0.35).astype(np.uint8)
+    dark_high_highlights = dark_low_highlights.copy()
+    dark_high_highlights[:200, :] = 235                        # cielo claro
+    t_low, _ = pm.choose_brightness(dark_low_highlights)
+    t_high, _ = pm.choose_brightness(dark_high_highlights)
+    assert t_low is not None
+    assert t_high is None or t_high < t_low
+
+
+def test_classic_chain_keeps_more_contrast_than_hdr():
+    img = very_dark()
+    classic, _, _ = pm.brighten_classic(img)
+    hdr, _, _ = pm.brighten_dark(img, "normal")
+    assert _lum(classic).std() > _lum(hdr).std()
+    assert _chroma(classic) >= _chroma(img)
+
+
+def test_auto_uses_hdr_when_highlights_already_high():
+    _, _, actions = pm.enhance_adaptive(window_scene())
+    assert any(x.startswith("HDR") for x in actions)

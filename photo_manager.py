@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Photo Manager CLI v1.13.0
+Photo Manager CLI v1.14.0
 Herramienta de gestión de fotos.
 
 Funcionalidades:
@@ -84,7 +84,7 @@ except ImportError:
 # CONSTANTES
 # ══════════════════════════════════════════════════
 
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 
 # [FIX #12] Separar formatos soportados por Pillow vs RAW
 PILLOW_EXTENSIONS = {
@@ -1522,7 +1522,7 @@ HDR_LEVELS = {
     "fuerte": (0.40, 1.0),
 }
 DEFAULT_HDR = "normal"
-AUTO_HDR = "fuerte"        # intensidad del HDR en el modo automático
+AUTO_HDR = "normal"        # valor por defecto para run_enhance (el auto lo elige solo)
 HDR_WEIGHT_MAX_PX = 2_000_000   # resolución máx. para calcular los pesos
 
 
@@ -1809,6 +1809,18 @@ def brighten_dark(bgr, level: str = DEFAULT_HDR) -> tuple:
         out = _gamma_toward(out, mean, target=target, amount=0.8)
     out = _restore_saturation(bgr, out)
 
+    out, gain, h = _denoise_after_lift(lum_before, out)
+    return out, gain, h
+
+
+def _denoise_after_lift(lum_before, out) -> tuple:
+    """Limpieza proporcional a cuánto se aclaró la foto.
+
+    El ruido y las manchas de color que estaban ocultos en la oscuridad se
+    hacen visibles al aclarar (el ruido medido ANTES no lo refleja). Fuerte
+    en color y suave en luminancia, para conservar el detalle; fuerte en
+    todo donde el original era casi negro. Devuelve (imagen, aclarado ×, h).
+    """
     gain = (float(cv2.cvtColor(out, cv2.COLOR_BGR2LAB)[:, :, 0].mean()) + 8) / \
            (float(lum_before.mean()) + 8)
     h = 0
@@ -1824,6 +1836,105 @@ def brighten_dark(bgr, level: str = DEFAULT_HDR) -> tuple:
             strong = cv2.fastNlMeansDenoisingColored(out, None, 8, 12, 7, 21)
             out = (mask * strong + (1 - mask) * out).astype(np.uint8)
     return out, gain, h
+
+
+# ── Aclarado clásico con brillo automático ────────
+# Cadena de un fotógrafo: exposición (igual en R, G, B, con "hombro" que
+# frena antes del blanco) → curva S → vibrance → calidez si está azulada →
+# limpieza. Con una foto real (selfie nocturno) quedó más natural que la
+# fusión HDR: mismo brillo y el triple de contraste en la cara.
+AUTO_BRIGHT_MIN = 100        # objetivos de brillo medio que se prueban
+AUTO_BRIGHT_MAX = 140
+AUTO_BRIGHT_STEP = 5
+# Límite para las zonas claras (percentil 98 de la luminancia). Calibrado con
+# la foto real: objetivo 120 → 222 (natural), 140 → 235 (cielo y pelo
+# blanquecinos). Si las luces ya estaban altas, se permite +8 sobre ellas.
+AUTO_HIGHLIGHT_P98 = 224
+AUTO_HIGHLIGHT_MARGIN = 8
+AUTO_MAX_BURN = 0.05         # % máx. de píxeles quemados (≥ 250)
+AUTO_MAX_GAIN = 3.0          # aclarado máx.: más allá el ruido se dispara
+AUTO_BACKLIT_GAIN = 1.08     # si la cadena no aclara más que esto → contraluz
+AUTO_BACKLIT_HDR = "normal"  # intensidad del HDR para contraluces
+
+
+def _exposure_lut(k: float):
+    """Curva de exposición con hombro: y = (1 − e^(−kx)) / (1 − e^(−k))."""
+    x = np.arange(256) / 255.0
+    return np.clip((1 - np.exp(-k * x)) / (1 - np.exp(-k)) * 255, 0, 255).astype(np.uint8)
+
+
+def _s_curve(bgr, amount: float = 0.25):
+    """Curva S suave sobre la luminancia: devuelve volumen tras aclarar."""
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    x = np.arange(256) / 255.0
+    curve = x + amount * (x - 0.5) * (1 - np.abs(2 * x - 1))
+    lab[:, :, 0] = cv2.LUT(lab[:, :, 0], np.clip(curve * 255, 0, 255).astype(np.uint8))
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+def _vibrance(bgr, amount: float = 0.5):
+    """Sube más el color de lo poco saturado (piel) que de lo ya intenso."""
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    chroma = np.hypot(lab[..., 1] - 128, lab[..., 2] - 128)
+    factor = 1 + amount * np.clip(1 - chroma / 40, 0, 1)
+    for c in (1, 2):
+        lab[..., c] = 128 + (lab[..., c] - 128) * factor
+    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
+def _classic_chain(bgr, k: float):
+    return _s_curve(cv2.LUT(bgr, _exposure_lut(k)))
+
+
+def choose_brightness(bgr) -> tuple[int | None, float]:
+    """Elige el brillo objetivo más alto que no blanquee las zonas claras.
+
+    Prueba de AUTO_BRIGHT_MAX hacia abajo (sobre una copia reducida, rápido)
+    y devuelve (objetivo, k de la curva). (None, 0) si ninguno cumple.
+    """
+    h, w = bgr.shape[:2]
+    small = bgr
+    if max(h, w) > BLUR_MAX_SIDE:
+        f = BLUR_MAX_SIDE / max(h, w)
+        small = cv2.resize(bgr, (max(1, round(w * f)), max(1, round(h * f))),
+                           interpolation=cv2.INTER_AREA)
+    lum = lambda x: cv2.cvtColor(x, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
+    l0 = lum(small)
+    limit = max(AUTO_HIGHLIGHT_P98, float(np.percentile(l0, 98)) + AUTO_HIGHLIGHT_MARGIN)
+    for target in range(AUTO_BRIGHT_MAX, AUTO_BRIGHT_MIN - 1, -AUTO_BRIGHT_STEP):
+        lo, hi = 0.01, 20.0                      # k que da ese brillo medio
+        for _ in range(20):
+            k = (lo + hi) / 2
+            if lum(cv2.LUT(small, _exposure_lut(k))).mean() < target:
+                lo = k
+            else:
+                hi = k
+        l1 = lum(_classic_chain(small, k))
+        gain = (l1.mean() + 8) / (l0.mean() + 8)
+        if (np.percentile(l1, 98) <= limit and (l1 >= 250).mean() * 100 <= AUTO_MAX_BURN
+                and gain <= AUTO_MAX_GAIN):
+            return target, k
+    return None, 0.0
+
+
+def brighten_classic(bgr, analysis: dict | None = None) -> tuple:
+    """Aclara con la cadena clásica y brillo elegido automáticamente.
+
+    Devuelve (imagen, objetivo | None, aclarado ×). Si ningún objetivo
+    respeta las zonas claras, devuelve la imagen sin cambios.
+    """
+    target, k = choose_brightness(bgr)
+    lum_before = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[:, :, 0]
+    if target is None:
+        return bgr, None, 1.0
+    out = _vibrance(_classic_chain(bgr, k))
+    a = analysis or {}
+    if a.get("db", 0) < -3:                      # neutros azulados → calentar
+        lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB).astype(np.float32)
+        lab[..., 2] += min(-a["db"], 10) * 0.7
+        out = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+    out, gain, _ = _denoise_after_lift(lum_before, out)
+    return out, target, gain
 
 
 def _shadow_share(bgr) -> float:
@@ -1907,12 +2018,28 @@ def enhance_adaptive(bgr, esrgan: Path | None = None, dry_run: bool = False,
     a["shadows"] = shadows
     brightened = False
     if mean < AUTO_HDR_MEAN or shadows > AUTO_HDR_SHADOWS:
-        # HDR + punto negro + color + limpieza (ver brighten_dark)
-        if not dry_run:
-            bgr, gain, _ = brighten_dark(bgr, hdr)
-            a["brighten_gain"] = gain
-        actions.append(f"HDR {hdr}: aclarar (brillo {mean:.0f}, "
-                       f"sombras {shadows * 100:.0f} %)")
+        target, k = choose_brightness(bgr)
+        small_gain = 1.0
+        if target is not None:
+            small = cv2.resize(bgr, (max(1, bgr.shape[1] // 4), max(1, bgr.shape[0] // 4)),
+                               interpolation=cv2.INTER_AREA)
+            lum_s = cv2.cvtColor(small, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
+            lum_c = cv2.cvtColor(_classic_chain(small, k), cv2.COLOR_BGR2LAB)[:, :, 0]
+            small_gain = (lum_c.mean() + 8) / (lum_s.mean() + 8)
+        if target is None or small_gain < AUTO_BACKLIT_GAIN:
+            # Luces ya altas (contraluz, ventana, cielo): la exposición global
+            # no puede abrir las sombras sin blanquearlas → fusión HDR.
+            if not dry_run:
+                bgr, gain, _ = brighten_dark(bgr, AUTO_BACKLIT_HDR)
+                a["brighten_gain"] = gain
+            actions.append(f"HDR: aclarar sombras, luces ya altas (brillo {mean:.0f}, "
+                           f"sombras {shadows * 100:.0f} %)")
+        else:
+            if not dry_run:
+                bgr, _, gain = brighten_classic(bgr, a)
+                a["brighten_gain"] = gain
+            a["brightness_target"] = target
+            actions.append(f"aclarar: brillo {mean:.0f} → {target} (automático)")
         brightened = True
     elif mean > AUTO_BRIGHT_MEAN:
         bgr = _gamma_toward(bgr, mean)
@@ -2528,7 +2655,7 @@ def menu_enhance():
     print(f"""
   Modos de mejora:
     1. Automático: analiza cada foto y corrige solo lo necesario
-       (amplía hasta {UPSCALE_TARGETS[AUTO_TARGET]['label']}, HDR {AUTO_HDR} en fotos oscuras){es_tag}
+       (amplía hasta {UPSCALE_TARGETS[AUTO_TARGET]['label']}, aclara fotos oscuras con brillo automático){es_tag}
     2. Real-ESRGAN: ampliar hasta {UPSCALE_TARGETS[AUTO_TARGET]['label']} (máx. ×4){es_tag}
     3. HDR: aclarar sombras sin quemar luces (a todas)
     4. Solo diagnosticar (no modifica nada, genera reporte)
