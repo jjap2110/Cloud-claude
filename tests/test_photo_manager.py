@@ -654,3 +654,19 @@ def test_menu_enhance_asks_only_folders_and_uses_4k(monkeypatch, tmp_path):
     assert len(asked) == 2                       # carpeta y salida
     (args, kwargs), = calls
     assert kwargs["target"] == "4k"
+
+
+@pytest.mark.skipif(not pm._HEIF, reason="pillow-heif no instalado")
+def test_compress_converts_heic_to_jpeg_even_if_larger(tmp_path):
+    """v1.15 conservaba el HEIC (el JPG ocupaba más) y la conversión no ocurría."""
+    src, out = tmp_path / "src", tmp_path / "out"
+    src.mkdir()
+    Image.fromarray(_textured(1200, 900)).save(
+        src / "iphone.heic", format="HEIF", quality=60,
+        exif=exif_bytes(original="2019:05:05 12:00:00"))
+    pm.run_compress(src, out, fmt="jpeg", quality=95)
+    res = out / "iphone.jpg"
+    assert res.exists() and not (out / "iphone.heic").exists()
+    with Image.open(res) as r:
+        assert r.format == "JPEG"
+        assert r.getexif().get_ifd(EXIF_IFD).get(36867) == "2019:05:05 12:00:00"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Photo Manager CLI v2.0.0
+Photo Manager CLI v2.0.1
 Herramienta de gestión de fotos.
 
 Funcionalidades:
@@ -80,7 +80,7 @@ except ImportError:
 # CONSTANTES
 # ══════════════════════════════════════════════════
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 
 # [FIX #12] Separar formatos soportados por Pillow vs RAW
 PILLOW_EXTENSIONS = {
@@ -1745,13 +1745,15 @@ COMPRESS_MAX_SIDES = {
     "whatsapp": ("WhatsApp estándar (lado largo 1600 px)", 1600),
 }
 COMPRESS_DEFAULT_QUALITY = 75
+_FORMAT_FAMILY = {".heic": "heif", ".heif": "heif", ".jpg": "jpeg", ".jpeg": "jpeg",
+                  ".webp": "webp"}
 
 
 def _compress_task(job: dict) -> dict:
     """Comprime una foto (proceso aparte). Nunca lanza excepciones.
 
-    status: ok | kept (el resultado no era más pequeño: se conserva el
-    original) | copied (animada/multipágina: copia sin tocar) | error
+    status: ok | kept (recomprimir en el mismo formato no lo hacía más
+    pequeño: se conserva el original) | copied (animada/multipágina: copia sin tocar) | error
     """
     src, dst, fmt = job["src"], job["dst"], job["fmt"]
     res = {"src": src, "status": "ok", "out": None, "resized": False,
@@ -1808,8 +1810,11 @@ def _compress_task(job: dict) -> dict:
         img.save(str(dst), **kw)
 
         new_size = dst.stat().st_size
-        if not res["resized"] and new_size >= res["orig_size"]:
-            # Recomprimir no ahorró nada: conservar el original intacto
+        same_format = _FORMAT_FAMILY.get(src.suffix.lower()) == fmt
+        if same_format and not res["resized"] and new_size >= res["orig_size"]:
+            # Recomprimir en el mismo formato no ahorró nada: conservar el
+            # original. (Si se cambia de formato, p. ej. HEIC → JPG para una
+            # app que no lee HEIC, se respeta la conversión aunque ocupe más.)
             dst.unlink()
             out = _unique_path(dst.with_suffix(src.suffix))
             shutil.copy2(str(src), str(out))
