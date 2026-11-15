@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ampliar Fotos v1.0.0 — super-resolución con Real-ESRGAN
+Ampliar Fotos v1.1.0 — super-resolución con Real-ESRGAN
 
 Amplía una foto, varias fotos o una carpeta entera (con subcarpetas).
 
@@ -18,7 +18,8 @@ Qué hace:
   - Lee JPG, PNG, WebP, TIFF, BMP y HEIC/HEIF.
 
 Requisitos:
-  pip install Pillow pillow-heif
+  Python 3.10+. Las dependencias (Pillow, pillow-heif) se instalan solas la
+  primera vez en una carpeta "venv" junto al script; no hay que activar nada.
   Real-ESRGAN: descarga realesrgan-ncnn-vulkan (v0.2.5.0) desde
   https://github.com/xinntao/Real-ESRGAN/releases y descomprímelo en una
   carpeta "realesrgan" junto a este script.
@@ -35,6 +36,49 @@ import tempfile
 import time
 from pathlib import Path
 
+VENV_PACKAGES = ["Pillow", "pillow-heif"]
+
+
+def _ensure_venv():
+    """Hace que el script se ejecute con su propio entorno virtual.
+
+    Un script no puede "activar" un entorno en la terminal que lo lanzó,
+    pero sí volver a arrancarse con el Python de ese entorno, que es
+    equivalente. El entorno es la carpeta "venv" junto al script:
+      - si ya se está ejecutando con él → no hace nada;
+      - si existe → se relanza con él;
+      - si no existe y falta Pillow → lo crea, instala las dependencias y
+        se relanza (solo la primera vez).
+    """
+    venv = Path(__file__).resolve().parent / "venv"
+    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if Path(sys.prefix).resolve() == venv or os.environ.get("AMPLIAR_FOTOS_VENV") == "1":
+        return
+    if not python.exists():
+        import importlib.util
+        if importlib.util.find_spec("PIL"):
+            return                   # este Python ya sirve; no hace falta entorno
+        print(f"  Preparando el entorno (solo la primera vez) en {venv} ...")
+        try:
+            subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+            subprocess.run([str(python), "-m", "pip", "install", "--quiet",
+                            "--disable-pip-version-check", *VENV_PACKAGES], check=True)
+        except (subprocess.CalledProcessError, OSError) as e:
+            shutil.rmtree(venv, ignore_errors=True)
+            print(f"  ✗ No se pudo crear el entorno: {e}")
+            print("    En Ubuntu puede faltar:  sudo apt install python3-venv")
+            sys.exit(1)
+        print("  ✓ Entorno listo.\n")
+    env = dict(os.environ, AMPLIAR_FOTOS_VENV="1")       # evita relanzarse en bucle
+    cmd = [str(python), str(Path(__file__).resolve()), *sys.argv[1:]]
+    if os.name == "nt":
+        sys.exit(subprocess.call(cmd, env=env))
+    os.execve(str(python), cmd, env)
+
+
+if __name__ == "__main__":
+    _ensure_venv()
+
 try:
     from PIL import Image, ImageOps
 except ImportError:
@@ -48,7 +92,7 @@ try:
 except ImportError:
     _HEIF = False
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # ══════════════════════════════════════════════════
 # CONFIGURACIÓN

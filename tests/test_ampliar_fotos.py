@@ -131,3 +131,21 @@ def test_interactive_loop(tmp_path, monkeypatch):
     monkeypatch.setattr("builtins.input", lambda _="": next(feed))
     assert af.main([]) == 0
     assert (tmp_path / "a_4K.jpg").exists()
+
+
+def test_relaunches_with_venv_next_to_script(tmp_path):
+    """Con una carpeta venv junto al script, se relanza con ese Python."""
+    import shutil
+    import subprocess
+    app = tmp_path / "app"
+    (app / "venv" / "bin").mkdir(parents=True)
+    shutil.copy(Path(af.__file__), app / "ampliar_fotos.py")
+    marker = tmp_path / "relanzado.txt"
+    fake_py = app / "venv" / "bin" / "python"
+    fake_py.write_text(f'#!/bin/sh\necho "$AMPLIAR_FOTOS_VENV|$@" > "{marker}"\n')
+    fake_py.chmod(0o755)
+    subprocess.run([sys.executable, str(app / "ampliar_fotos.py"), "foto con espacio.jpg"],
+                   check=True, timeout=60)
+    flag, args = marker.read_text().strip().split("|", 1)
+    assert flag == "1"
+    assert args.endswith("ampliar_fotos.py foto con espacio.jpg")
