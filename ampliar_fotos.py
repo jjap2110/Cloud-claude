@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ampliar Fotos v1.1.0 — super-resolución con Real-ESRGAN
+Ampliar Fotos v1.1.1 — super-resolución con Real-ESRGAN
 
 Amplía una foto, varias fotos o una carpeta entera (con subcarpetas).
 
@@ -45,17 +45,32 @@ def _ensure_venv():
     Un script no puede "activar" un entorno en la terminal que lo lanzó,
     pero sí volver a arrancarse con el Python de ese entorno, que es
     equivalente. El entorno es la carpeta "venv" junto al script:
-      - si ya se está ejecutando con él → no hace nada;
+      - si ya se está ejecutando con él → instala lo que le falte;
       - si existe → se relanza con él;
       - si no existe y falta Pillow → lo crea, instala las dependencias y
         se relanza (solo la primera vez).
     """
     venv = Path(__file__).resolve().parent / "venv"
     python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    if Path(sys.prefix).resolve() == venv or os.environ.get("AMPLIAR_FOTOS_VENV") == "1":
+    import importlib.util
+    if Path(sys.prefix).resolve() == venv:
+        # Ya dentro del entorno: instalar lo que le falte (p. ej. un venv
+        # creado a mano, o al que se le añadió una dependencia nueva).
+        modules = {"Pillow": "PIL", "pillow-heif": "pillow_heif"}
+        missing = [pkg for pkg in VENV_PACKAGES
+                   if not importlib.util.find_spec(modules.get(pkg, pkg))]
+        if missing:
+            print(f"  Instalando en el entorno: {', '.join(missing)} ...")
+            try:
+                subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                                "--disable-pip-version-check", *missing], check=True)
+                importlib.invalidate_caches()
+            except (subprocess.CalledProcessError, OSError) as e:
+                print(f"  ✗ No se pudo instalar: {e}")
+        return
+    if os.environ.get("AMPLIAR_FOTOS_VENV") == "1":
         return
     if not python.exists():
-        import importlib.util
         if importlib.util.find_spec("PIL"):
             return                   # este Python ya sirve; no hace falta entorno
         print(f"  Preparando el entorno (solo la primera vez) en {venv} ...")
@@ -92,7 +107,7 @@ try:
 except ImportError:
     _HEIF = False
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 # ══════════════════════════════════════════════════
 # CONFIGURACIÓN
