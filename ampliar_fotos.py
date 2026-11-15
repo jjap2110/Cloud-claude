@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ampliar Fotos v1.1.1 — super-resolución con Real-ESRGAN
+Ampliar Fotos v1.1.2 — super-resolución con Real-ESRGAN
 
 Amplía una foto, varias fotos o una carpeta entera (con subcarpetas).
 
@@ -47,18 +47,18 @@ def _ensure_venv():
     equivalente. El entorno es la carpeta "venv" junto al script:
       - si ya se está ejecutando con él → instala lo que le falte;
       - si existe → se relanza con él;
-      - si no existe y falta Pillow → lo crea, instala las dependencias y
-        se relanza (solo la primera vez).
+      - si no existe y a este Python le falta alguna dependencia → lo crea,
+        instala las dependencias y se relanza (solo la primera vez).
     """
     venv = Path(__file__).resolve().parent / "venv"
     python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     import importlib.util
+    modules = {"Pillow": "PIL", "pillow-heif": "pillow_heif"}
+    missing = [pkg for pkg in VENV_PACKAGES
+               if not importlib.util.find_spec(modules.get(pkg, pkg))]
     if Path(sys.prefix).resolve() == venv:
         # Ya dentro del entorno: instalar lo que le falte (p. ej. un venv
         # creado a mano, o al que se le añadió una dependencia nueva).
-        modules = {"Pillow": "PIL", "pillow-heif": "pillow_heif"}
-        missing = [pkg for pkg in VENV_PACKAGES
-                   if not importlib.util.find_spec(modules.get(pkg, pkg))]
         if missing:
             print(f"  Instalando en el entorno: {', '.join(missing)} ...")
             try:
@@ -71,8 +71,8 @@ def _ensure_venv():
     if os.environ.get("AMPLIAR_FOTOS_VENV") == "1":
         return
     if not python.exists():
-        if importlib.util.find_spec("PIL"):
-            return                   # este Python ya sirve; no hace falta entorno
+        if not missing:
+            return                   # este Python ya tiene todo; no hace falta entorno
         print(f"  Preparando el entorno (solo la primera vez) en {venv} ...")
         try:
             subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
@@ -107,7 +107,7 @@ try:
 except ImportError:
     _HEIF = False
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 
 # ══════════════════════════════════════════════════
 # CONFIGURACIÓN
